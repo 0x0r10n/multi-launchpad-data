@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Database
+*.db
+*.db-journal
+
+# Environment
+.env
+.env.local
+devnet-keypair.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo

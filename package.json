@@ -1,0 +1,38 @@
+{
+    "name": "pumpfun-devnet-test",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "start": "ts-node src/index.ts",
+        "dev": "nodemon --exec ts-node src/index.ts",
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "test:devnet": "ts-node src/devnet-test.ts",
+        "mint:devnet": "ts-node src/mint-devnet.ts"
+    },
+    "keywords": [],
+    "author": "FORGE <noreply@forge-protocol.com>",
+    "license": "ISC",
+    "type": "commonjs",
+    "dependencies": {
+        "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
+        "@metaplex-foundation/umi": "^1.4.1",
+        "@metaplex-foundation/umi-bundle-defaults": "^1.4.1",
+        "@solana/spl-token": "^0.4.14",
+        "@solana/web3.js": "^1.98.4",
+        "@types/node": "^25.1.0",
+        "dotenv": "^17.2.3",
+        "express": "^5.2.1",
+        "node-fetch": "^3.3.2",
+        "sqlite3": "^5.1.7",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3",
+        "ws": "^8.19.0"
+    },
+    "devDependencies": {
+        "@types/express": "^5.0.6",
+        "@types/node-fetch": "^2.6.13",
+        "@types/ws": "^8.18.1",
+        "nodemon": "^3.1.11"
+    }
+}
