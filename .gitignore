@@ -38,3 +38,7 @@ Thumbs.db
 dist/
 build/
 *.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc

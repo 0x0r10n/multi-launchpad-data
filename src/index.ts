@@ -12,6 +12,12 @@ const bs58 = require('bs58');
 
 dotenv.config();
 
+// BigInt serialization fix for Socket.io
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
+
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -287,6 +293,20 @@ db.serialize(() => {
   db.run(`ALTER TABLE tokens ADD COLUMN hasFileMetaData INTEGER DEFAULT 0`, (err) => { });
   db.run(`ALTER TABLE tokens ADD COLUMN graduation_timestamp INTEGER`, (err) => { });
   db.run(`ALTER TABLE tokens RENAME COLUMN topHoldersPercentage TO top10holderspercentage`, (err) => { });
+
+  // Dev Migration Stats Table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS dev_stats (
+      creator TEXT PRIMARY KEY,
+      total_launched INTEGER DEFAULT 0,
+      total_migrated INTEGER DEFAULT 0,
+      last_full_scan INTEGER,
+      last_updated INTEGER
+    )
+  `);
+  db.run(`ALTER TABLE dev_stats ADD COLUMN last_full_scan INTEGER`, (err) => { });
+
+
 });
 
 // App & Socket.io Broadcasting
@@ -300,13 +320,56 @@ const io = new Server(server, {
   }
 });
 
-// 1. Join multiple rooms on connection
+// Socket.io Production-Grade Room System
 io.on('connection', (socket) => {
-  console.log(`[SOCKET] New client connected: ${socket.id}`);
+  console.log(`[SOCKET] Client ${socket.id} connected`);
 
+  // 1. Join General Rooms (Overview)
   socket.on('join', (room: string) => {
-    socket.join(room);
-    console.log(`[SOCKET] Client ${socket.id} joined room: ${room}`);
+    if (typeof room === 'string') {
+      socket.join(room);
+      console.log(`[SOCKET] Client joined general room: ${room}`);
+    }
+  });
+
+  // 2. Subscribe to specific token (Detailed updates)
+  socket.on('subscribe-token', (mint: string) => {
+    if (!mint) return;
+    socket.join(`token:${mint}`);
+    socket.join(`fees:${mint}`);
+    socket.join(`price-by-token:${mint}`);
+    socket.join(`chart-data:${mint}`);
+    socket.join(`holders:${mint}`);
+    socket.join(`snipers:${mint}`);
+    socket.join(`insiders:${mint}`);
+    socket.join(`dex:${mint}`);
+    console.log(`[SOCKET] Subscribed to token rooms for mint: ${mint}`);
+  });
+
+  // 3. Subscribe to dev stats for a wallet
+  socket.on('subscribe-dev', async (wallet: string) => {
+    if (!wallet) return;
+    socket.join(`dev-stats:${wallet}`);
+    console.log(`[SOCKET] Subscribed to dev-stats for wallet: ${wallet}`);
+
+    // Send initial stats on join
+    const stats = await getFullDevStats(wallet);
+    socket.emit('message', { type: 'dev-stats', wallet, data: stats });
+  });
+
+  // 4. Subscribe to a specific wallet's transactions
+  socket.on('subscribe-wallet', (wallet: string) => {
+    if (!wallet) return;
+    socket.join(`wallet:${wallet}`);
+    console.log(`[SOCKET] Client subscribed to wallet: ${wallet}`);
+  });
+
+  // 5. Subscribe to a specific pool room
+  socket.on('subscribe-pool', (pool: string) => {
+    if (!pool) return;
+    socket.join(`pool:${pool}`);
+    socket.join(`price-by-pool:${pool}`);
+    console.log(`[SOCKET] Client subscribed to pool: ${pool}`);
   });
 
   socket.on('disconnect', () => {
@@ -316,59 +379,149 @@ io.on('connection', (socket) => {
 
 // Core Broadcast Functions
 function broadcastNewToken(tokenData: any) {
-  io.to('latest-tokens').emit('message', { type: 'new-token', data: tokenData });
-  io.to('new').emit('message', { type: 'new-token', data: tokenData }); // compatibility
-  console.log(`📡 Broadcasted NEW TOKEN: ${tokenData.data?.token?.symbol || tokenData.coinMint}`);
+  const payload = { type: 'new-token', data: tokenData };
+  io.to('latest-tokens').emit('message', payload);
+  if (tokenData.bondingCurveProgress >= 80) {
+    io.to('graduating').emit('message', payload);
+  }
 }
 
 function broadcastGraduating(tokenData: any) {
-  io.to('graduating').emit('message', { type: 'graduating', data: tokenData });
+  io.to('graduating').emit('message', { type: 'graduating-update', data: tokenData });
 }
 
 function broadcastGraduated(tokenData: any) {
-  io.to('graduated').emit('message', { type: 'graduated', data: tokenData });
+  io.to('graduated').emit('message', { type: 'graduated-update', data: tokenData });
 }
 
-function broadcastPriceUpdate(tokenMint: string, priceUpdate: any) {
-  io.to('price-by-token').emit('message', { type: 'price-update', mint: tokenMint, data: priceUpdate });
-  io.to('price-aggregated').emit('message', { type: 'price-update', mint: tokenMint, data: priceUpdate });
+function broadcastPriceUpdate(tokenMint: string, priceUpdate: any, poolAddress?: string) {
+  io.to(`price-by-token:${tokenMint}`).emit('message', { type: 'price-update', mint: tokenMint, data: priceUpdate });
+  if (poolAddress) {
+    io.to(`price-by-pool:${poolAddress}`).emit('message', { type: 'price-update', pool: poolAddress, data: priceUpdate });
+  }
+  // Also send to general room for overview table compatibility if needed
+  io.to('latest-tokens').emit('message', { type: 'price-update', mint: tokenMint, data: priceUpdate });
 }
 
-function broadcastChartData(tokenMint: string, candleData: any) {
-  io.to('chart-data').emit('message', { type: 'chart-update', mint: tokenMint, data: candleData });
+function broadcastChartData(tokenMint: string, candleData: any, poolAddress?: string) {
+  io.to(`chart-data:${tokenMint}`).emit('message', { type: 'chart-update', mint: tokenMint, data: candleData });
+  if (poolAddress) {
+    io.to(`chart-data:${poolAddress}`).emit('message', { type: 'chart-update', pool: poolAddress, data: candleData });
+  }
 }
 
-function broadcastTransaction(txData: any) {
-  io.to('token-transactions').emit('message', { type: 'transaction', data: txData });
-  io.to('pool-transactions').emit('message', { type: 'transaction', data: txData });
+function broadcastTransaction(txData: any, poolAddress?: string) {
+  io.to(`token:${txData.mint}`).emit('message', { type: 'transaction', data: txData });
+  if (poolAddress) {
+    io.to(`pool:${poolAddress}`).emit('message', { type: 'transaction', data: txData });
+  }
 }
 
 function broadcastHolders(tokenMint: string, holdersData: any) {
-  io.to('holders').emit('message', { type: 'holders-update', mint: tokenMint, data: holdersData });
+  io.to(`holders:${tokenMint}`).emit('message', { type: 'holders-update', mint: tokenMint, data: holdersData });
 }
 
 function broadcastSniperUpdate(tokenMint: string, sniperData: any) {
-  io.to('sniper-tracking').emit('message', { type: 'sniper-update', mint: tokenMint, data: sniperData });
+  io.to(`snipers:${tokenMint}`).emit('message', { type: 'sniper-update', mint: tokenMint, data: sniperData });
 }
 
 function broadcastInsiderUpdate(tokenMint: string, insiderData: any) {
-  io.to('insider-tracking').emit('message', { type: 'insider-update', mint: tokenMint, data: insiderData });
+  io.to(`insiders:${tokenMint}`).emit('message', { type: 'insider-update', mint: tokenMint, data: insiderData });
 }
 
 function broadcastDevHoldings(tokenMint: string, devData: any) {
-  io.to('developer-holdings').emit('message', { type: 'dev-holdings', mint: tokenMint, data: devData });
+  io.to(`token:${tokenMint}`).emit('message', { type: 'dev-holdings', mint: tokenMint, data: devData });
 }
 
 function broadcastTop10(tokenMint: string, top10Data: any) {
-  io.to('top10-holders').emit('message', { type: 'top10-update', mint: tokenMint, data: top10Data });
+  io.to(`holders:${tokenMint}`).emit('message', { type: 'top10-update', mint: tokenMint, data: top10Data });
 }
 
 function broadcastWalletTransactions(wallet: string, txData: any) {
-  io.to('wallet-transactions').emit('message', { type: 'wallet-tx', wallet, data: txData });
+  // Use generic wallet room
+  io.to(`wallet:${wallet}`).emit('message', { type: 'wallet-tx', wallet, data: txData });
 }
 
 function broadcastStatistics(stats: any) {
-  io.to('token-statistics').emit('message', { type: 'statistics', data: stats });
+  io.to('token-statistics-total').emit('message', { type: 'global-stats', data: stats });
+}
+
+function broadcastDevUpdate(creator: string, updatedStats: any) {
+  io.to(`dev-stats:${creator}`).emit('message', {
+    type: 'dev-stats',
+    wallet: creator,
+    data: updatedStats
+  });
+}
+
+function broadcastFees(mint: string, feeData: any) {
+  io.to(`fees:${mint}`).emit('message', { type: 'fee-update', mint, data: feeData });
+}
+
+/**
+ * DEX Data Feature - Ready for integration
+ * This function broadcasts DEX Paid status and Boost counts to the dexroom and token-specific dex rooms.
+ */
+function broadcastDexInfo(mint: string, dexInfo: { dex_paid: boolean; active_boosts: number }) {
+  const payload = {
+    type: 'dex_info',
+    mint,
+    dex_paid: dexInfo.dex_paid,
+    active_boosts: dexInfo.active_boosts,
+    timestamp: Date.now(),
+    // bonus: show golden badge if >=500
+    show_golden: (dexInfo.active_boosts || 0) >= 500
+  };
+  io.to(`dex:${mint}`).emit('message', payload);
+  io.to('dexroom').emit('message', payload);
+}
+
+export async function getFullDevStats(creator: string): Promise<{
+  total_launched: number;
+  total_migrated: number;
+}> {
+  console.log(`[DevStats] Pulsing live on-chain data for creator: ${creator}`);
+
+  let launched = 0;
+  let migrated = 0;
+
+  try {
+    const signatures = await rpcQueue.add((c) => c.getSignaturesForAddress(
+      new PublicKey(creator),
+      { limit: 1000 }
+    ));
+
+    for (const sigInfo of signatures) {
+      try {
+        const tx = await rpcQueue.add((c) => c.getParsedTransaction(sigInfo.signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed'
+        }));
+
+        if (!tx || !tx.meta || !tx.meta.logMessages) continue;
+
+        const logs = tx.meta.logMessages;
+        const isCreate = logs.some(l =>
+          l.includes('Instruction: Create') ||
+          l.includes('Instruction: CreateConfig') ||
+          l.includes('initialize_virtual_pool')
+        );
+
+        const isComplete = logs.some(l =>
+          l.includes('PoolIsCompleted') ||
+          l.includes('MigrationDammV2') ||
+          l.includes('graduated')
+        );
+
+        if (isCreate) launched++;
+        if (isComplete) migrated++;
+      } catch (innerErr) { }
+    }
+  } catch (e: any) {
+    console.error(`[DevStats] Live Scan Error: ${e.message}`);
+  }
+
+  return { total_launched: launched, total_migrated: migrated };
 }
 
 async function broadcast(payload: any) {
@@ -429,6 +582,15 @@ async function enqueueTrade(mint: string, trade: any, signature?: string) {
 
 async function formatFullPayload(row: any, solPrice: number) {
   const liquiditySol = row.real_sol || 0;
+
+  // Fetch Dev Stats
+  const devStats: any = await new Promise((resolve) => {
+    db.get('SELECT total_launched, total_migrated FROM dev_stats WHERE creator = ?', [row.dev], (err, stats: any) => {
+      if (err || !stats) resolve({ total_launched: 0, total_migrated: 0 });
+      else resolve(stats);
+    });
+  });
+
 
   // Fetch price history for OHLCV
   const priceHistory: any[] = await new Promise((resolve) => {
@@ -553,12 +715,17 @@ async function formatFullPayload(row: any, solPrice: number) {
         top10: row.top10holderspercentage || 0,
         dev: {
           percentage: row.devHoldingsPercentage || 0,
-          amount: (row.devHoldingsPercentage / 100) * 1000000000
+          amount: (row.devHoldingsPercentage / 100) * 1000000000,
+          stats: devStats
         }
       },
       graduation: {
         status: row.graduation_status || "new",
         timestamp: row.graduation_timestamp || null
+      },
+      dev_stats: {
+        total_launched: devStats.total_launched,
+        total_migrated: devStats.total_migrated
       },
       priceHistory
     }
@@ -1059,32 +1226,128 @@ async function getBondingCurveInfo(mint: string, platform: string = 'pump', pool
   try {
     const mintKey = new PublicKey(mint);
     let pda: PublicKey;
-    if (poolAddress) {
+
+    if (poolAddress && poolAddress !== 'unknown') {
       pda = new PublicKey(poolAddress);
     } else if (platform === 'pump') {
       [pda] = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mintKey.toBuffer()], PUMP_PROGRAM_ID);
+    } else if (platform === 'moonshot') {
+      [pda] = PublicKey.findProgramAddressSync([Buffer.from('token'), mintKey.toBuffer()], MOONSHOT_PROGRAM_ID);
     } else {
       return null;
     }
-    const info = await rpcQueue.add((c) => c.getAccountInfo(pda)).catch(() => null);
-    if (!info) return null;
 
+    const info = await rpcQueue.add((c) => c.getAccountInfo(pda)).catch(() => null);
+    if (!info || !info.data || info.data.length < 40) return null;
+
+    // Standard Layout (Pump/Moonshot use similar for virtual reserves)
     const data = info.data.slice(8);
     const vToken = Number(data.readBigUInt64LE(0)) / 1e6;
     const vSol = Number(data.readBigUInt64LE(8)) / 1e9;
     const rToken = Number(data.readBigUInt64LE(16)) / 1e6;
     const rSol = Number(data.readBigUInt64LE(24)) / 1e9;
-    const isComplete = data.readUInt8(40) === 1;
+    const isComplete = data.length > 40 ? data.readUInt8(40) === 1 : false;
 
     const priceQuote = vSol / vToken;
     const solPrice = await getSolPrice();
+    const priceUsd = priceQuote * solPrice;
 
-    // Moonshot might have different curve targets, but user said same layout
-    const targetSol = platform === 'moonshot' ? 100 : 85; // Heuristic or as per launchpad
-    const curvePercentage = Math.min(100, (rSol / targetSol) * 100);
+    // Targets (Mainnet standards)
+    let targetSol = 85;
+    if (platform === 'moonshot') targetSol = 100;
+    if (platform === 'bags') targetSol = 50; // Heuristic for BAGS
 
-    return { pda: pda.toString(), vSol, vToken, rSol, rToken, isComplete, priceQuote, priceUsd: priceQuote * solPrice, curvePercentage, solPrice };
-  } catch { return null; }
+    // Virtual Progress: (Real SOL / Target SOL) * 100
+    // Pump starts with 30 SOL liquidity usually
+    const currentSol = platform === 'pump' ? (vSol - 30) : rSol;
+    const curvePercentage = Math.min(100, (currentSol / targetSol) * 100);
+
+    return {
+      pda: pda.toString(),
+      vSol, vToken, rSol, rToken,
+      isComplete, priceQuote, priceUsd, curvePercentage, solPrice
+    };
+  } catch (e) { return null; }
+}
+
+export async function checkFundingSource(wallet: string, creator: string): Promise<boolean> {
+  if (!wallet || !creator || wallet === creator) return false;
+  try {
+    const signatures = await rpcQueue.add((c) => c.getSignaturesForAddress(new PublicKey(wallet), { limit: 10 }));
+    if (!signatures || signatures.length === 0) return false;
+
+    // Look for a transfer from creator to this wallet in their recent history
+    for (const sig of signatures) {
+      const tx = await rpcQueue.add((c) => c.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }));
+      if (tx && tx.meta) {
+        const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
+        const creatorIndex = accountKeys.indexOf(creator);
+        const walletIndex = accountKeys.indexOf(wallet);
+
+        if (creatorIndex !== -1 && walletIndex !== -1) {
+          // Check for net gain in wallet from creator's pre/post balances
+          const creatorDiff = (tx.meta.postBalances[creatorIndex] - tx.meta.preBalances[creatorIndex]) / 1e9;
+          const walletDiff = (tx.meta.postBalances[walletIndex] - tx.meta.preBalances[walletIndex]) / 1e9;
+          if (creatorDiff < 0 && walletDiff > 0) {
+            console.log(`🔗 Detected funding connection: Dev (${creator.slice(0, 5)}) -> Wallet (${wallet.slice(0, 5)})`);
+            return true;
+          }
+        }
+      }
+    }
+  } catch (e) { }
+  return false;
+}
+
+export async function detectInsiders(mint: string, creator: string = 'unknown', launchTx: string = 'unknown', pool: string = 'unknown'): Promise<{
+  insiders: string[];
+  snipers: string[];
+}> {
+  const insiders: Set<string> = new Set();
+  const snipers: Set<string> = new Set();
+  const earlyBuyers: Set<string> = new Set();
+
+  try {
+    const sigs = await rpcQueue.add((c) => c.getSignaturesForAddress(new PublicKey(mint), { limit: 20 }));
+    if (!sigs) return { insiders: [], snipers: [] };
+
+    for (const sigInfo of sigs) {
+      const tx = await rpcQueue.add((c) => c.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }));
+      if (!tx || !tx.meta) continue;
+
+      const accs = tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
+      for (let i = 0; i < accs.length; i++) {
+        const addr = accs[i];
+        if (addr === creator || addr === mint || addr === pool || addr === PUMP_PROGRAM_ID.toBase58()) continue;
+
+        // Buying if post balance > pre balance
+        if ((tx.meta.postBalances[i] - tx.meta.preBalances[i]) > 0) {
+          // Check if this wallet is another PDA or program (skip)
+          if (tx.transaction.message.accountKeys[i].signer) {
+            earlyBuyers.add(addr);
+            // If they are in the launch tx itself, they are immediate insiders
+            if (sigInfo.signature === launchTx) insiders.add(addr);
+          }
+        }
+      }
+    }
+
+    // Secondary Cross-Reference: Funding Source (Deep Insider Detection)
+    for (const wallet of earlyBuyers) {
+      const isFundedByDev = await checkFundingSource(wallet, creator);
+      if (isFundedByDev) {
+        insiders.add(wallet);
+      } else {
+        snipers.add(wallet); // Early but not funded (likely a bot)
+      }
+    }
+
+  } catch (e) { }
+
+  return {
+    insiders: Array.from(insiders),
+    snipers: Array.from(snipers)
+  };
 }
 
 function parseMetaplexMetadata(data: Buffer, isInstruction = false) {
@@ -1244,27 +1507,9 @@ async function fetchAndSaveMetadata(mint: string, context?: any, launchpad: stri
     const solPrice = await getSolPrice();
     const marketCap = (curve?.priceUsd || (30 / 1073000000) * solPrice) * 1000000000;
     let creationTime = context?.timestamp ? Number(context.timestamp) * 1000 : Date.now();
-    let insiderWallets: string[] = [];
-
-    if (context?.signature) {
-      try {
-        const tx: any = await rpcQueue.add((c) => (c as any).getTransaction(context.signature, { maxSupportedTransactionVersion: 0 }));
-        if (tx?.meta?.postBalances && tx.transaction.message) {
-          const dev = context.creator;
-          const accounts = tx.transaction.message.accountKeys || tx.transaction.message.staticAccountKeys;
-          for (let i = 0; i < accounts.length; i++) {
-            const addr = accounts[i].toString();
-            // 🛡️ Exclude dev, the token mint itself, and the bonding curve pool address
-            const isMint = addr === mint;
-            const isPool = addr === curve?.pda || addr === context?.bonding_curve;
-
-            if (addr !== dev && !isMint && !isPool && (tx.meta.preBalances[i] < tx.meta.postBalances[i])) {
-              insiderWallets.push(addr);
-            }
-          }
-        }
-      } catch (err) { }
-    }
+    const { insiders, snipers } = await detectInsiders(mint, context?.creator, context?.signature, curve?.pda);
+    const insiderWallets = insiders;
+    const sniperWallets = snipers;
 
     const row: any = {
       coinMint: mint,
@@ -1305,7 +1550,7 @@ async function fetchAndSaveMetadata(mint: string, context?: any, launchpad: stri
       real_sol: curve?.rSol || 0,
       real_token: curve?.rToken || 793100000,
       is_complete: 0,
-      sniperWallets: "[]",
+      sniperWallets: JSON.stringify(sniperWallets),
       insiderWallets: JSON.stringify(insiderWallets),
       sniperTotalBalance: 0,
       insiderTotalBalance: 0,
@@ -1342,7 +1587,33 @@ async function fetchAndSaveMetadata(mint: string, context?: any, launchpad: stri
           monitoredMints.add(mint);
           db.run(`INSERT INTO price_history(coinMint, price, volume, timestamp) VALUES(?, ?, ?, ?)`,
             [mint, row.currentMarketPrice, 0, (creationTime as any)]);
-          broadcast(row);
+
+          // Dev Migration Stats (Full Scan if needed)
+          (async () => {
+            const stats: any = await new Promise((resolve) => {
+              db.get('SELECT * FROM dev_stats WHERE creator = ?', [row.dev], (err, s) => resolve(s));
+            });
+
+            if (!stats || !stats.last_full_scan || Date.now() - stats.last_full_scan > 24 * 60 * 60 * 1000) {
+              const devStats = await getFullDevStats(row.dev);
+              db.run(`
+                INSERT OR REPLACE INTO dev_stats (creator, total_launched, total_migrated, last_full_scan, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+              `, [row.dev, devStats.total_launched, devStats.total_migrated, Date.now(), Date.now()], () => {
+                broadcastDevUpdate(row.dev, devStats);
+                broadcast(row);
+              });
+            } else {
+              db.run(`
+                UPDATE dev_stats SET total_launched = total_launched + 1, last_updated = ? WHERE creator = ?
+              `, [Date.now(), row.dev], () => {
+                db.get('SELECT total_launched, total_migrated FROM dev_stats WHERE creator = ?', [row.dev], (err, s: any) => {
+                  if (!err && s) broadcastDevUpdate(row.dev, s);
+                  broadcast(row);
+                });
+              });
+            }
+          })();
           console.log(`✅ Token successfully broadcasted: ${mint.slice(0, 8)}`);
         }
       });
@@ -1507,13 +1778,14 @@ function connectWS() {
                       }
                     }
                   } else if (allAccounts.includes(METDBC_PROGRAM.toBase58())) {
-                    // 2. Meteora DBC Check
+                    // 2. Meteora DBC Check - Production Indices
                     const meteoraIx = (tx.transaction.message.instructions as any[]).find(ix => ix.programId.toBase58() === METDBC_PROGRAM.toBase58());
                     if (meteoraIx && meteoraIx.accounts) {
                       const accounts = meteoraIx.accounts.map((a: any) => a.toBase58 ? a.toBase58() : a.toString());
                       const creator = accounts[2] || 'unknown';
                       const mint = accounts[3] || 'unknown';
-                      const pool = accounts[5] || 'unknown';
+                      const pool = accounts[4] || 'unknown'; // Using index 4 as the correct pool/bonding curve address
+
                       if (mint !== 'unknown' && mint.length >= 32) {
                         // 🛡️ Filter Base Tokens (SOL, USDC, etc)
                         const BASE_TOKENS = ['So11111111111111111111111111111111111111112', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'Es9vMFrzaDCSTjG3L69G9v9YTyV2ZP6SS8uHLL758686'];
@@ -1694,38 +1966,80 @@ async function updateHolderStats(mint: string) {
 
 async function handleTrade(trade: any, signature?: string) {
   const solVol = Number(trade.solAmount) / 1e9;
-  db.get('SELECT sniperWallets, buyTransactions, sellTransactions, volume, creationTime, lastSignature, platform FROM tokens WHERE coinMint = ?', [trade.mint], async (err, row: any) => {
+  db.get('SELECT dev, sniperWallets, insiderWallets, buyTransactions, sellTransactions, volume, creationTime, lastSignature, platform, poolAddress FROM tokens WHERE coinMint = ?', [trade.mint], async (err, row: any) => {
     try {
       if (err || !row) return;
       if (signature && signature === row.lastSignature) return;
 
       const snipers = JSON.parse(row.sniperWallets || '[]');
+      const insiders = JSON.parse(row.insiderWallets || '[]');
       let { buyTransactions, sellTransactions, volume } = row;
       if (trade.isBuy) buyTransactions++; else sellTransactions++;
       const totalTx = buyTransactions + sellTransactions;
       const newVol = volume + solVol;
 
-      if (trade.isBuy && (Number(trade.timestamp) * 1000 - row.creationTime) < 15000 && !snipers.includes(trade.user)) {
-        snipers.push(trade.user);
-        updateHolderStats(trade.mint).catch(() => { });
+      if (trade.isBuy && (Number(trade.timestamp) * 1000 - row.creationTime) < 15000) {
+        if (!snipers.includes(trade.user) && !insiders.includes(trade.user) && trade.user !== row.dev) {
+          // Identify if they are a real insider or just a fast sniper
+          const isFundedByDev = await checkFundingSource(trade.user, row.dev);
+          if (isFundedByDev) {
+            insiders.push(trade.user);
+            console.log(`🕵️ Real-time Insider Detected: ${trade.user.slice(0, 8)}`);
+          } else {
+            snipers.push(trade.user);
+            console.log(`🤖 Real-time Sniper Detected: ${trade.user.slice(0, 8)}`);
+          }
+          updateHolderStats(trade.mint).catch(() => { });
+        }
       }
 
-      const currentPriceUsd = (Number(trade.vSol) / Number(trade.vToken)) * 0.001 * (cachedSolPrice || await getSolPrice());
+      // 🛰️ Real-time On-Chain Verification (Price & Fees)
+      let livePriceUsd = (Number(trade.vSol) / Number(trade.vToken)) * 0.001 * (cachedSolPrice || 160);
+      let realFeeSol = solVol * 0.01; // Default
+
+      if (signature) {
+        try {
+          const detailedTx = await rpcQueue.add((c) => c.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }));
+          if (detailedTx && detailedTx.meta) {
+            // Find Treasury/Platform fee by identifying balance changes in global fee accounts
+            const feeAccounts = [
+              'Fee8ZDkZRpxU86gY7d72r8sFm9sWw4nS1T2V6XU5C', // Pump.fun Fee
+              '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium (Proxy)
+              'C98A6qPvS4DVs3vF79hWv9C8sNWHf4pQf3YyXG6t9k4D' // Moonshot Fee
+            ];
+
+            let totalTreasuryGain = 0;
+            const accountKeys = detailedTx.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
+            for (let i = 0; i < accountKeys.length; i++) {
+              if (feeAccounts.includes(accountKeys[i])) {
+                const gain = (detailedTx.meta.postBalances[i] - detailedTx.meta.preBalances[i]) / 1e9;
+                if (gain > 0) totalTreasuryGain += gain;
+              }
+            }
+            if (totalTreasuryGain > 0) realFeeSol = totalTreasuryGain;
+          }
+        } catch (e) { }
+      }
+
       const progress = Math.min(100, ((Number(trade.vSol) / 1e9 - (row.platform === 'moonshot' ? 0 : 30)) / (row.platform === 'moonshot' ? 100 : 85)) * 100);
 
-      db.run(`UPDATE tokens SET buyTransactions=?, sellTransactions=?, transactions=?, volume=?, sniperWallets=?, sniperCount=?, currentMarketPrice=?, marketCap=?, bondingCurveProgress=?, graduation_status=?, lastSignature=? WHERE coinMint=?`,
-        [buyTransactions, sellTransactions, totalTx, newVol, JSON.stringify(snipers), snipers.length, currentPriceUsd, currentPriceUsd * 1e9, progress, progress >= 80 ? 'imminent' : 'new', signature || row.lastSignature, trade.mint],
+      db.run(`UPDATE tokens SET buyTransactions=?, sellTransactions=?, transactions=?, volume=?, sniperWallets=?, insiderWallets=?, sniperCount=?, currentMarketPrice=?, marketCap=?, bondingCurveProgress=?, graduation_status=?, lastSignature=? WHERE coinMint=?`,
+        [buyTransactions, sellTransactions, totalTx, newVol, JSON.stringify(snipers), JSON.stringify(insiders), snipers.length, livePriceUsd, livePriceUsd * 1e9, progress, progress >= 80 ? 'imminent' : 'new', signature || row.lastSignature, trade.mint],
         (err) => {
           if (!err) {
-            // Log into price_history
             db.run(`INSERT INTO price_history (coinMint, price, volume, timestamp) VALUES (?, ?, ?, ?)`,
-              [trade.mint, currentPriceUsd, solVol, Date.now()]);
+              [trade.mint, livePriceUsd, solVol, Date.now()]);
 
             db.get('SELECT * FROM tokens WHERE coinMint = ?', [trade.mint], (err, updatedRow) => {
               if (!err && updatedRow) {
                 broadcast(updatedRow);
-                // Specialized trade broadcasts
-                broadcastPriceUpdate(trade.mint, { price: currentPriceUsd, timestamp: Date.now() });
+                broadcastPriceUpdate(trade.mint, { price: livePriceUsd, timestamp: Date.now() }, row.poolAddress);
+                broadcastFees(trade.mint, {
+                  mint: trade.mint,
+                  total_fees_sol: realFeeSol,
+                  timestamp: Date.now(),
+                  tx_signature: signature
+                });
                 broadcastTransaction({
                   mint: trade.mint,
                   signature,
@@ -1734,7 +2048,7 @@ async function handleTrade(trade: any, signature?: string) {
                   solAmount: solVol,
                   tokenAmount: trade.tokenAmount,
                   timestamp: Date.now()
-                });
+                }, row.poolAddress);
                 broadcastWalletTransactions(trade.user, {
                   mint: trade.mint,
                   signature,
@@ -1743,17 +2057,26 @@ async function handleTrade(trade: any, signature?: string) {
                   timestamp: Date.now()
                 });
 
-                // Update aggregate stats on every trade too
-                broadcastStatistics({
+                // Update aggregate stats on every trade with real mainnet data
+                const stats = {
                   totalTokens: monitoredMints.size,
                   solPrice: cachedSolPrice,
+                  totalVolume24h: 0,
                   timestamp: Date.now()
+                };
+
+                // Get real total volume from DB asynchronously
+                db.get('SELECT SUM(volume) as total FROM tokens', (err, result: any) => {
+                  if (!err && result) {
+                    stats.totalVolume24h = result.total || 0;
+                    broadcastStatistics(stats);
+                  }
                 });
 
                 // Fetch recent history for chart update
                 db.all('SELECT price, volume, timestamp FROM price_history WHERE coinMint = ? ORDER BY timestamp DESC LIMIT 1', [trade.mint], (err, history) => {
                   if (!err && history.length > 0) {
-                    broadcastChartData(trade.mint, history[0]);
+                    broadcastChartData(trade.mint, history[0], row.poolAddress);
                   }
                 });
               }
@@ -1787,9 +2110,38 @@ async function poll() {
             }
           }
           const mc = curve.priceUsd * 1e9;
+          const newGraduationStatus = curve.isComplete ? 'graduated' : (curve.curvePercentage >= 80 ? 'imminent' : (row.graduation_status || 'new'));
+
           db.run(`UPDATE tokens SET virtual_sol=?, virtual_token=?, real_sol=?, real_token=?, is_complete=?, bondingCurveProgress=?, currentMarketPrice=?, marketCap=?, allTimeHighMarketCap=?, graduation_status=? WHERE coinMint=?`,
-            [curve.vSol, curve.vToken, curve.rSol, curve.rToken, curve.isComplete ? 1 : 0, curve.curvePercentage, curve.priceUsd, mc, Math.max(row.allTimeHighMarketCap || 0, mc), curve.isComplete ? 'graduated' : (curve.curvePercentage >= 80 ? 'imminent' : (row.graduation_status || 'new')), row.coinMint],
-            () => updateHolderStats(row.coinMint).catch(() => { })
+            [curve.vSol, curve.vToken, curve.rSol, curve.rToken, curve.isComplete ? 1 : 0, curve.curvePercentage, curve.priceUsd, mc, Math.max(row.allTimeHighMarketCap || 0, mc), newGraduationStatus, row.coinMint],
+            () => {
+              if (curve.isComplete && row.graduation_status !== 'graduated') {
+                (async () => {
+                  const stats: any = await new Promise((resolve) => {
+                    db.get('SELECT * FROM dev_stats WHERE creator = ?', [row.dev], (err, s) => resolve(s));
+                  });
+
+                  if (!stats || !stats.last_full_scan || Date.now() - (stats.last_full_scan || 0) > 24 * 60 * 60 * 1000) {
+                    const devStats = await getFullDevStats(row.dev);
+                    db.run(`
+                      INSERT OR REPLACE INTO dev_stats (creator, total_launched, total_migrated, last_full_scan, last_updated)
+                      VALUES (?, ?, ?, ?, ?)
+                    `, [row.dev, devStats.total_launched, devStats.total_migrated, Date.now(), Date.now()], () => {
+                      broadcastDevUpdate(row.dev, devStats);
+                    });
+                  } else {
+                    db.run(`
+                      UPDATE dev_stats SET total_migrated = total_migrated + 1, last_updated = ? WHERE creator = ?
+                    `, [Date.now(), row.dev], () => {
+                      db.get('SELECT total_launched, total_migrated FROM dev_stats WHERE creator = ?', [row.dev], (err, s: any) => {
+                        if (!err && s) broadcastDevUpdate(row.dev, s);
+                      });
+                    });
+                  }
+                })();
+              }
+              updateHolderStats(row.coinMint).catch(() => { })
+            }
           );
         }
       } catch (e) { }
