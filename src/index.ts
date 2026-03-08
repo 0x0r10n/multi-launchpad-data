@@ -454,6 +454,77 @@ function broadcastDevUpdate(creator: string, updatedStats: any) {
   });
 }
 
+/**
+ * Trending Tokens Feature
+ * Calculates top 10 tokens by volume for 1m, 5m, 30m, 1h intervals.
+ */
+const trendingIntervals = {
+  '1m': 60,
+  '5m': 300,
+  '30m': 1800,
+  '1h': 3600
+};
+
+function dbAll(query: string, params: any[] = []): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+async function calculateTrending(intervalSeconds: number) {
+  const now = Date.now();
+  const start = now - intervalSeconds * 1000;
+  const launchpads = ['pump', 'moonshot', 'letsbonk', 'meteora', 'daosfun'];
+
+  // Query tokens sorted by volume in the given time window
+  const query = `
+    SELECT t.*, 
+      SUM(p.volume) as interval_volume
+    FROM tokens t
+    JOIN price_history p ON t.coinMint = p.coinMint
+    WHERE t.platform IN (${launchpads.map(() => '?').join(',')})
+      AND p.timestamp >= ?
+    GROUP BY t.coinMint
+    ORDER BY interval_volume DESC
+    LIMIT 30
+  `;
+
+  try {
+    const rows = await dbAll(query, [...launchpads, start]);
+    const solPrice = cachedSolPrice || (await getSolPrice());
+    const payloads = await Promise.all(rows.map(row => {
+      // Use the interval-specific volume for the broadcast payload
+      const trendingRow = { ...row, volume: row.interval_volume || 0 };
+      return formatFullPayload(trendingRow, solPrice);
+    }));
+
+    return payloads.map(payload => ({
+      ...payload,
+      room: 'trending-tokens'
+    }));
+  } catch (err) {
+    console.error(`[Trending] Query Error for ${intervalSeconds}s:`, err);
+    return [];
+  }
+}
+
+async function broadcastTrending() {
+  console.log(`[Trending] Calculating updates for all intervals...`);
+  for (const [interval, seconds] of Object.entries(trendingIntervals)) {
+    const trendingData = await calculateTrending(seconds);
+    io.to('trending-tokens').emit('trending-update', { interval, data: trendingData });
+  }
+}
+
+// Timer to calculate and broadcast every 1m
+setInterval(broadcastTrending, 60 * 1000);
+
+// Initial run on startup (after a short delay for DB stabilization)
+setTimeout(broadcastTrending, 10000);
+
 function broadcastFees(mint: string, feeData: any) {
   io.to(`fees:${mint}`).emit('message', { type: 'fee-update', mint, data: feeData });
 }
