@@ -462,12 +462,13 @@ function broadcastFees(mint: string, feeData: any) {
  * DEX Data Feature - Ready for integration
  * This function broadcasts DEX Paid status and Boost counts to the dexroom and token-specific dex rooms.
  */
-function broadcastDexInfo(mint: string, dexInfo: { dex_paid: boolean; active_boosts: number }) {
+function broadcastDexInfo(mint: string, dexInfo: { dex_paid: boolean; active_boosts: number; banner_url?: string }) {
   const payload = {
     type: 'dex_info',
     mint,
     dex_paid: dexInfo.dex_paid,
     active_boosts: dexInfo.active_boosts,
+    banner_url: dexInfo.banner_url || null,
     timestamp: Date.now(),
     // bonus: show golden badge if >=500
     show_golden: (dexInfo.active_boosts || 0) >= 500

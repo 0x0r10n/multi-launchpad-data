@@ -95,13 +95,27 @@ class DexChecker:
             'dex_paid': self.check_paid(chain_id, token_address),
             'active_boosts': self.check_boosts(chain_id, token_address),
         }
+
+        banner_url = None
+        if info['dex_paid']:
+            # NEW: Fetch banner from the official profiles endpoint (most reliable)
+            try:
+                profiles = self._make_request(f"https://api.dexscreener.com/token-profiles/latest/v1?chainId={chain_id}&tokenAddress={token_address}")
+                for p in profiles:
+                    if p.get('tokenAddress', '').lower() == token_address.lower():
+                        banner_url = p.get('header') or p.get('banner') or None
+                        break
+            except:
+                banner_url = None  # graceful fallback
+
+        info['banner_url'] = banner_url
         return info
 
     def bulk_check(self, tokens: list) -> dict:
         """
         tokens = [('solana', 'addr1'), ('solana', 'addr2'), ...]
         Returns exactly the payload your broadcastDexInfo expects:
-        { 'addr1': {'dex_paid': True, 'active_boosts': 520, 'show_golden': True, 'timestamp': 1741400000000}, ... }
+        { 'addr1': {'dex_paid': True, 'active_boosts': 520, 'show_golden': True, 'banner_url': '...', 'timestamp': ...}, ... }
         """
         results = {}
         for i, (chain_id, token_address) in enumerate(tokens):
@@ -114,6 +128,7 @@ class DexChecker:
                 'dex_paid': info['dex_paid'],
                 'active_boosts': info['active_boosts'],
                 'show_golden': info['active_boosts'] >= 500,
+                'banner_url': info.get('banner_url'),
                 'timestamp': int(time.time() * 1000)
             }
         return results
