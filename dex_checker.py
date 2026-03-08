@@ -91,25 +91,30 @@ class DexChecker:
         return 0
 
     def check_dex_info(self, chain_id: str, token_address: str) -> dict:
-        info = {
-            'dex_paid': self.check_paid(chain_id, token_address),
-            'active_boosts': self.check_boosts(chain_id, token_address),
-        }
+        # Existing paid + boosts
+        is_paid = self.check_paid(chain_id, token_address)
+        boosts = self.check_boosts(chain_id, token_address)
 
         banner_url = None
-        if info['dex_paid']:
-            # NEW: Fetch banner from the official profiles endpoint (most reliable)
+        if is_paid:
+            # BEST WAY: Use the main pair endpoint (always has the banner if paid)
             try:
-                profiles = self._make_request(f"https://api.dexscreener.com/token-profiles/latest/v1?chainId={chain_id}&tokenAddress={token_address}")
-                for p in profiles:
-                    if p.get('tokenAddress', '').lower() == token_address.lower():
-                        banner_url = p.get('header') or p.get('banner') or None
-                        break
+                data = self._make_request(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}")
+                if isinstance(data, dict) and data.get('pairs'):
+                    for pair in data['pairs']:
+                        if pair.get('chainId') == chain_id:
+                            pair_info = pair.get('info', {})
+                            banner_url = pair_info.get('header') or pair_info.get('banner') or pair_info.get('imageUrl')
+                            break
             except:
-                banner_url = None  # graceful fallback
+                banner_url = None
 
-        info['banner_url'] = banner_url
-        return info
+        return {
+            'dex_paid': is_paid,
+            'active_boosts': boosts,
+            'banner_url': banner_url,
+            'show_golden': boosts >= 500
+        }
 
     def bulk_check(self, tokens: list) -> dict:
         """
