@@ -34,30 +34,63 @@ async function updateCurveData(mint: string) {
   if (!accountInfo || !accountInfo.data) return;
 
   const data = accountInfo.data;
-  if (data.length < 49) return; // min size: 8 disc + 5*8 + 1
+  const platform = tokenData.platform || "pump";
+  let virtualTokenReserves = 0;
+  let virtualSolReserves = 0;
+  let realTokenReserves = 0;
+  let realSolReserves = 0;
+  let tokenTotalSupply = TOTAL_SUPPLY;
+  let complete = false;
+  let curvePercentage = 0;
 
-  // Parse bonding curve fields (little-endian u64)
-  const virtualTokenReserves = readU64(data, 8);
-  const virtualSolReserves = readU64(data, 16);
-  const realTokenReserves = readU64(data, 24);
-  const realSolReserves = readU64(data, 32);
-  const tokenTotalSupply = readU64(data, 40);
-  const complete = data[48] === 1;
+  if (platform === "pump" || platform === "letsbonk") {
+    if (data.length < 49) return;
+    virtualTokenReserves = readU64(data, 8);
+    virtualSolReserves = readU64(data, 16);
+    realTokenReserves = readU64(data, 24);
+    realSolReserves = readU64(data, 32);
+    tokenTotalSupply = readU64(data, 40);
+    complete = data[48] === 1;
+
+    const realSol = realSolReserves / LAMPORTS_PER_SOL;
+    curvePercentage = Math.min(100, (realSol / BONDING_CURVE_TARGET_SOL) * 100);
+  } else if (platform === "moon" || platform === "bags") {
+    if (data.length < 24) return;
+    virtualTokenReserves = readU64(data, 8);
+    virtualSolReserves = readU64(data, 16);
+    
+    if (data.length >= 40) {
+      realTokenReserves = readU64(data, 24);
+      realSolReserves = readU64(data, 32);
+    }
+
+    // Moonshot / Bags progress based on target = 100 SOL, using virtualSol
+    curvePercentage = Math.min(100, Number((BigInt(virtualSolReserves) * BigInt(100)) / BigInt(100_000_000_000)));
+    complete = curvePercentage >= 100;
+  } else if (platform === "launchlab") {
+    if (data.length < 32) return;
+    // Raydium LaunchLab: virtual reserves at offset 24, target = 100 SOL
+    virtualTokenReserves = readU64(data, 8);
+    virtualSolReserves = readU64(data, 24);
+    
+    if (data.length >= 40) {
+      realSolReserves = readU64(data, 32);
+    }
+
+    curvePercentage = Math.min(100, Number((BigInt(virtualSolReserves) * BigInt(100)) / BigInt(100_000_000_000)));
+    complete = curvePercentage >= 100;
+  }
 
   // Calculate price (SOL per token)
   const priceInSol = virtualSolReserves > 0 && virtualTokenReserves > 0
     ? (virtualSolReserves / LAMPORTS_PER_SOL) / (virtualTokenReserves / Math.pow(10, TOKEN_DECIMALS))
     : 0;
 
-  // Liquidity = virtual SOL reserves (what's available to trade against)
+  // Liquidity = virtual SOL reserves
   const liquiditySol = virtualSolReserves / LAMPORTS_PER_SOL;
 
   // Market cap = price * total supply
   const marketCapSol = priceInSol * TOTAL_SUPPLY;
-
-  // Curve percentage: real SOL deposited / 85 SOL target
-  const realSol = realSolReserves / LAMPORTS_PER_SOL;
-  const curvePercentage = Math.min(100, (realSol / BONDING_CURVE_TARGET_SOL) * 100);
 
   // Volume 24h: sum trade volumes from last 24 hours
   const now = Date.now();

@@ -23,7 +23,9 @@ async function enrichToken(mint: string) {
 
   // === PRIMARY: Pump.fun API (instant, reliable) ===
   let enriched = false;
-  try {
+  
+  if (!existing.platform || existing.platform === "pump") {
+    try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
 
@@ -53,6 +55,7 @@ async function enrichToken(mint: string) {
     }
   } catch {
     // Pump.fun API failed, fall through to IPFS
+  }
   }
 
   // === FALLBACK: Fetch from token URI (IPFS/HTTP) ===

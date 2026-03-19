@@ -63,9 +63,19 @@ async function analyzeRisk(mint: string) {
   );
 
   const curvePDA = tokenData.curvePDA || "";
+  const platform = tokenData.platform || "pump";
 
-  // Filter out the bonding curve from the top 10 consideration
-  const validHolders = resolvedHolders.filter(h => h.owner !== curvePDA && h.address !== curvePDA);
+  const excludeWallets = platform === "moon" 
+    ? ["MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG", "Moonit1111111111111111111111111111111111111"] // Moon.it / Moonshot fee/treasury
+    : [];
+
+  // Filter out the bonding curve and any platform-specific treasury wallets
+  const validHolders = resolvedHolders.filter(h => 
+    h.owner !== curvePDA && 
+    h.address !== curvePDA &&
+    !excludeWallets.includes(h.owner) &&
+    !excludeWallets.includes(h.address)
+  );
 
   
   const top10RawAmount = validHolders
@@ -110,27 +120,32 @@ async function analyzeRisk(mint: string) {
     }
   }
 
-  // Simple heuristic: wallets in top 10 that are NOT the dev (bonding curve already filtered)
+  // Fetch time-based snipers logged during the first 20s of trading
+  const knownSnipers = await redis.smembers(`snipers_set:${mint}`);
+
   const sniperWallets: any[] = [];
   const insiderWallets: any[] = [];
 
   for (const w of top10Wallets) {
     if (w.owner === creator) continue; // Skip dev (counted separately)
-    if (w.percentage < 0.5) continue; // Skip dust
+    if (w.percentage < 0.2) continue; // Skip dust
 
-    // Snipers: large holders (>1% of supply)
-    if (w.percentage >= 1.0) {
+    const walletAddress = w.owner || w.address;
+    const isKnownSniper = knownSnipers.includes(walletAddress);
+
+    // Snipers: Time-based snipers OR massive holders (>1% of supply)
+    if (isKnownSniper || w.percentage >= 1.0) {
       sniperWallets.push({
-        wallet: w.owner || w.address,
+        wallet: walletAddress,
         percentage: w.percentage,
         amount: w.amount,
+        isTimeBasedSniper: isKnownSniper
       });
     }
-
     // Insiders: moderate holders (0.5% - 1%)
-    if (w.percentage >= 0.5 && w.percentage < 1.0) {
+    else if (w.percentage >= 0.5) {
       insiderWallets.push({
-        wallet: w.owner || w.address,
+        wallet: walletAddress,
         percentage: w.percentage,
         amount: w.amount,
       });

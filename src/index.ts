@@ -60,6 +60,20 @@ yellowstone.on("trade", async (data: any) => {
   queueCurveUpdate(data.mint);
   recordPrice(data.mint);
 
+  try {
+    const createdAt = await redis.hget(`token:${data.mint}`, "createdAt");
+    if (createdAt && data.type === "buy" && data.maker) {
+      const ageMs = Date.now() - parseInt(createdAt);
+      // Sniper logic: any buy within first 20 seconds is a sniper
+      // (Using 20s as Moon.it and Pump.fun have varying immediate launch activity)
+      if (ageMs <= 20_000) {
+        await redis.sadd(`snipers_set:${data.mint}`, data.maker);
+        // Expiry of 12h for Redis memory hygiene
+        await redis.expire(`snipers_set:${data.mint}`, 43_200); 
+      }
+    }
+  } catch (err) {}
+
   // Trigger risk analysis if not yet analyzed
   const analyzed = await redis.hget(`token:${data.mint}`, "riskAnalyzedAt");
   if (!analyzed) queueRiskAnalysis(data.mint);
@@ -192,6 +206,7 @@ app.get("/", async (_req, res) => {
 async function buildTokenPayload(d: Record<string, string>): Promise<any> {
   const createdAt = parseInt(d.createdAt || Date.now().toString());
   const mint = d.mint || "";
+  const platform = d.platform || "pump";
 
   // Fetch price history inline so every broadcast includes it
   const priceHistory = mint ? await getPriceHistory(mint, 50) : [];
@@ -209,7 +224,7 @@ async function buildTokenPayload(d: Record<string, string>): Promise<any> {
         description: d.description || "",
         image: d.image || "",
         hasFileMetaData: !!(d.uri),
-        createdOn: "https://pump.fun",
+        createdOn: platform === "moon" ? "https://moon.it" : platform === "bags" ? "https://bags.fm" : platform === "letsbonk" ? "https://letsbonk.fun" : platform === "launchlab" ? "https://raydium.io/launchlab" : "https://pump.fun",
         strictSocials: {
           twitter: d.twitter || "",
           telegram: d.telegram || "",
@@ -244,7 +259,7 @@ async function buildTokenPayload(d: Record<string, string>): Promise<any> {
           mintAuthority: null
         },
         quoteToken: "So11111111111111111111111111111111111111112",
-        market: "pumpfun",
+        market: platform === "pump" ? "pumpfun" : platform,
         deployer: d.creator || "",
         lastUpdated: Date.now(),
         createdAt: createdAt,

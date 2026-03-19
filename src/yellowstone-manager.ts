@@ -8,6 +8,11 @@ import Redis from "ioredis";
 import "dotenv/config";
 
 const PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const MOONSHOT = "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG"; // legacy
+const MOON_IT = "Moonit1111111111111111111111111111111111111"; // current moon.it
+const BAGS = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+const LETSBONK = "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1";
+const LAUNCHLAB = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 const redis = new Redis(process.env.REDIS_URL!);
 
 export class YellowstoneManager extends EventEmitter {
@@ -30,7 +35,7 @@ export class YellowstoneManager extends EventEmitter {
       this.stream = await client.subscribe();
       console.log("[Yellowstone] Stream opened.");
       this.setupStream();
-      this.subscribeToPumpFun();
+      this.subscribeToLaunchpads();
     } catch (err: any) {
       console.error("[Yellowstone] Connect fail:", err.message);
       this.handleReconnect();
@@ -72,15 +77,15 @@ export class YellowstoneManager extends EventEmitter {
     });
   }
 
-  private subscribeToPumpFun() {
+  private subscribeToLaunchpads() {
     const req: any = {
       accounts: {},
       slots: {},
       transactions: {
-        pump: {
+        launchpads: {
           vote: false,
           failed: false,
-          accountInclude: [PUMP_FUN],
+          accountInclude: [PUMP_FUN, MOONSHOT, MOON_IT, BAGS, LETSBONK, LAUNCHLAB],
           accountExclude: [],
           accountRequired: [],
         },
@@ -93,7 +98,7 @@ export class YellowstoneManager extends EventEmitter {
       accountsDataSlice: [],
     };
     this.stream.write(req);
-    console.log("[Yellowstone] Subscribed to Pump.fun (PROCESSED).");
+    console.log("[Yellowstone] Subscribed to 6 launchpads (Pump.fun + Moon.it + Bags + LetsBonk + LaunchLab).");
   }
 
   // ===== Yellowstone gRPC structure =====
@@ -126,26 +131,44 @@ export class YellowstoneManager extends EventEmitter {
 
 
 
+    // --- Detect Platform ---
+    const platform = this.getPlatform(meta, message);
+    if (!platform) return;
+
     // --- Extract mint ---
     const mint = this.extractMint(meta);
     if (!mint) return;
 
-    // --- Detect Create: only emit if we can parse name/symbol from event log ---
-    const parsed = this.parseCreateInstruction(message, meta);
-    if (parsed.name && parsed.symbol) {
+    // --- Extract Maker/Signer ---
+    const maker = message?.accountKeys?.[0] 
+      ? bs58.encode(message.accountKeys[0]) 
+      : "unknown";
+
+    // --- Detect Create ---
+    const isCreate = this.isCreate(platform, logs, message, meta);
+    if (isCreate) {
+      const parsed = this.parseCreateInstruction(message, meta);
+      const name = parsed.name || "Unknown Token";
+      const symbol = parsed.symbol || "???";
+      
+      // If Pump.fun, we strictly require name/symbol to be parsed. Moonshot can pass with defaults until enriched.
+      if (platform === "pump" && (!parsed.name || !parsed.symbol)) {
+        return;
+      }
+
       const creator = message?.accountKeys?.[0]
         ? bs58.encode(message.accountKeys[0])
         : "unknown";
-      const curvePDA = this.deriveCurvePDA(mint);
+      const curvePDA = this.deriveCurvePDA(platform, mint);
       const slot = wrapper.slot?.toString() || "0";
 
-      console.log(`[Yellowstone] 🚀 NEW TOKEN: ${parsed.name} ($${parsed.symbol}) | ${mint.slice(0,12)} | sig=${signature.slice(0,8)}`);
+      console.log(`[Yellowstone] 🚀 NEW TOKEN (${platform}): ${name} ($${symbol}) | ${mint.slice(0,12)} | sig=${signature.slice(0,8)}`);
 
       const tokenData: Record<string, string> = {
         mint, creator, curvePDA,
-        platform: "pump",
-        name: parsed.name,
-        symbol: parsed.symbol,
+        platform,
+        name,
+        symbol,
         uri: parsed.uri || "",
         decimals: "6",
         createdAt: Date.now().toString(),
@@ -160,7 +183,7 @@ export class YellowstoneManager extends EventEmitter {
     }
 
     // --- Detect Swap (Buy/Sell) ---
-    const swapType = this.detectSwapType(logs);
+    const swapType = this.detectSwapType(platform, logs, meta);
     if (swapType) {
       // Calculate SOL amount from balance changes
       const solAmount = this.calcSolDelta(meta);
@@ -183,7 +206,7 @@ export class YellowstoneManager extends EventEmitter {
         // Trim trades older than 24h
         await redis.zremrangebyscore(`trades:${mint}`, 0, now - 86_400_000);
 
-        this.emit("trade", { mint, signature, type: swapType, solAmount });
+        this.emit("trade", { mint, signature, type: swapType, solAmount, maker });
       }
     }
   }
@@ -200,38 +223,199 @@ export class YellowstoneManager extends EventEmitter {
     return "";
   }
 
-  private isCreate(logs: string[], message: any, meta?: any): boolean {
-    // Check logs first (fastest)
-    if (logs.some(l => l.includes("Program log: Instruction: Create"))) return true;
-
-    const CREATE_DISC = "181ec828051c0777";
-
-    // Check top-level instructions
-    if (message?.instructions) {
-      for (const ix of message.instructions) {
-        const d = Buffer.from(ix.data || []);
-        if (d.length >= 8 && d.slice(0, 8).toString("hex") === CREATE_DISC) return true;
-      }
+  private getPlatform(meta: any, message: any): "pump" | "moon" | "bags" | "letsbonk" | "launchlab" | null {
+    if (!meta || !message) return null;
+    const logStr = (meta.logMessages || []).join(" ");
+    if (logStr.includes(PUMP_FUN)) return "pump";
+    if (logStr.includes(MOONSHOT) || logStr.includes(MOON_IT)) return "moon";
+    if (logStr.includes(BAGS)) return "bags";
+    if (logStr.includes(LETSBONK)) return "letsbonk";
+    if (logStr.includes(LAUNCHLAB)) return "launchlab";
+    
+    // Fallback: check program IDs in instructions
+    const accountKeys = message.accountKeys || [];
+    for (const key of accountKeys) {
+      const b58 = bs58.encode(key);
+      if (b58 === PUMP_FUN) return "pump";
+      if (b58 === MOONSHOT || b58 === MOON_IT) return "moon";
+      if (b58 === BAGS) return "bags";
+      if (b58 === LETSBONK) return "letsbonk";
+      if (b58 === LAUNCHLAB) return "launchlab";
     }
+    return null;
+  }
 
-    // Check inner instructions (CPI — where Pump.fun Create actually lives)
-    if (meta?.innerInstructions) {
-      for (const inner of meta.innerInstructions) {
-        for (const ix of (inner.instructions || [])) {
+  private isCreate(platform: string, logs: string[], message: any, meta?: any): boolean {
+    if (platform === "pump") {
+      // Check logs first (fastest)
+      if (logs.some(l => l.includes("Program log: Instruction: Create"))) return true;
+
+      const CREATE_DISC = "181ec828051c0777";
+
+      // Check top-level instructions
+      if (message?.instructions) {
+        for (const ix of message.instructions) {
           const d = Buffer.from(ix.data || []);
           if (d.length >= 8 && d.slice(0, 8).toString("hex") === CREATE_DISC) return true;
         }
       }
+
+      // Check inner instructions (CPI)
+      if (meta?.innerInstructions) {
+        for (const inner of meta.innerInstructions) {
+          for (const ix of (inner.instructions || [])) {
+            const d = Buffer.from(ix.data || []);
+            if (d.length >= 8 && d.slice(0, 8).toString("hex") === CREATE_DISC) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    if (platform === "moon") {
+      // Moonshot create is identified by discriminator `2a9a1c1e0f0a1b2c` or specific logs
+      const MOON_CREATE_DISC = "2a9a1c1e0f0a1b2c";
+      
+      if (logs.some(l => l.toLowerCase().includes("tokenmint"))) return true;
+      
+      if (message?.instructions) {
+        for (const ix of message.instructions) {
+          const d = Buffer.from(ix.data || []);
+          if (d.length >= 8 && d.slice(0, 8).toString("hex") === MOON_CREATE_DISC) return true;
+        }
+      }
+      if (meta?.innerInstructions) {
+        for (const inner of meta.innerInstructions) {
+          for (const ix of (inner.instructions || [])) {
+            const d = Buffer.from(ix.data || []);
+            if (d.length >= 8 && d.slice(0, 8).toString("hex") === MOON_CREATE_DISC) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    if (platform === "bags") {
+      const isBagsCreate = logs.some(l => 
+        l.includes("InitializeVirtualPool") || 
+        l.includes("initialize_virtual_pool") || 
+        l.includes("DBC: New Pool") || 
+        l.includes("Meteora DBC: Initialize")
+      );
+      if (isBagsCreate) return true;
+      return false;
+    }
+
+    if (platform === "letsbonk") {
+      // LetsBonk uses similar Anchor patterns to Pump.fun
+      if (logs.some(l => l.includes("Program log: Instruction: Create"))) return true;
+
+      // Check instruction discriminator in top-level + inner instructions
+      const allIx: any[] = [];
+      if (message?.instructions) allIx.push(...message.instructions);
+      if (meta?.innerInstructions) {
+        for (const inner of meta.innerInstructions) {
+          if (inner.instructions) allIx.push(...inner.instructions);
+        }
+      }
+      for (const ix of allIx) {
+        const d = Buffer.from(ix.data || []);
+        if (d.length >= 8) {
+          // Check for InitializeMint2 (SPL token creation) as a signal
+          if (d[0] === 20) return true; // InitializeMint2 discriminator
+        }
+      }
+      return false;
+    }
+
+    if (platform === "launchlab") {
+      // Raydium LaunchLab uses Anchor-style logs
+      if (logs.some(l => l.includes("Program log: Instruction: Create") || l.includes("InitializePool") || l.includes("LaunchPool"))) return true;
+
+      // Check for InitializeMint2 in inner instructions
+      const allIx: any[] = [];
+      if (message?.instructions) allIx.push(...message.instructions);
+      if (meta?.innerInstructions) {
+        for (const inner of meta.innerInstructions) {
+          if (inner.instructions) allIx.push(...inner.instructions);
+        }
+      }
+      for (const ix of allIx) {
+        const d = Buffer.from(ix.data || []);
+        if (d.length >= 1 && d[0] === 20) return true;
+      }
+      return false;
     }
 
     return false;
   }
 
-  private detectSwapType(logs: string[]): "buy" | "sell" | null {
-    for (const l of logs) {
-      if (l.includes("Program log: Instruction: Buy")) return "buy";
-      if (l.includes("Program log: Instruction: Sell")) return "sell";
+  private detectSwapType(platform: string, logs: string[], meta: any): "buy" | "sell" | null {
+    if (platform === "pump") {
+      for (const l of logs) {
+        if (l.includes("Program log: Instruction: Buy")) return "buy";
+        if (l.includes("Program log: Instruction: Sell")) return "sell";
+      }
     }
+    
+    if (platform === "moon") {
+      for (const l of logs) {
+        if (l.includes("Buy") || l.includes("buy")) return "buy";
+        if (l.includes("Sell") || l.includes("sell")) return "sell";
+      }
+      // Fallback: check SOL balances if logs dont explicitly say Buy/Sell
+      const pre = meta?.preBalances;
+      const post = meta?.postBalances;
+      if (pre && post && pre.length > 0) {
+        const delta = Number(post[0]) - Number(pre[0]);
+        if (delta < -10000) return "buy";  // Spent SOL
+        if (delta > 10000) return "sell";  // Gained SOL
+      }
+    }
+
+    if (platform === "bags") {
+      for (const l of logs) {
+        if (l.includes("Buy") || l.toLowerCase().includes("buy")) return "buy";
+        if (l.includes("Sell") || l.toLowerCase().includes("sell")) return "sell";
+      }
+      const pre = meta?.preBalances;
+      const post = meta?.postBalances;
+      if (pre && post && pre.length > 0) {
+        const delta = Number(post[0]) - Number(pre[0]);
+        if (delta < -10000) return "buy";
+        if (delta > 10000) return "sell";
+      }
+    }
+
+    if (platform === "letsbonk") {
+      for (const l of logs) {
+        if (l.includes("Program log: Instruction: Buy")) return "buy";
+        if (l.includes("Program log: Instruction: Sell")) return "sell";
+      }
+      // Fallback: SOL balance delta
+      const pre = meta?.preBalances;
+      const post = meta?.postBalances;
+      if (pre && post && pre.length > 0) {
+        const delta = Number(post[0]) - Number(pre[0]);
+        if (delta < -10000) return "buy";
+        if (delta > 10000) return "sell";
+      }
+    }
+
+    if (platform === "launchlab") {
+      for (const l of logs) {
+        if (l.includes("Buy") || l.includes("buy")) return "buy";
+        if (l.includes("Sell") || l.includes("sell")) return "sell";
+      }
+      const pre = meta?.preBalances;
+      const post = meta?.postBalances;
+      if (pre && post && pre.length > 0) {
+        const delta = Number(post[0]) - Number(pre[0]);
+        if (delta < -10000) return "buy";
+        if (delta > 10000) return "sell";
+      }
+    }
+
     return null;
   }
 
@@ -248,14 +432,48 @@ export class YellowstoneManager extends EventEmitter {
     return Math.max(0, (delta - 5000) / 1_000_000_000);
   }
 
-  private deriveCurvePDA(mint: string): string {
+  private deriveCurvePDA(platform: string, mint: string): string {
     try {
-      const [pda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
-        new PublicKey(PUMP_FUN)
-      );
-      return pda.toBase58();
-    } catch { return ""; }
+      if (platform === "pump") {
+        const [pda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
+          new PublicKey(PUMP_FUN)
+        );
+        return pda.toBase58();
+      }
+      if (platform === "moon") {
+        // Moon.it / Moonshot bonding curve derivation (try MOON_IT first)
+        const programId = MOON_IT;
+        const [pda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
+          new PublicKey(programId)
+        );
+        return pda.toBase58();
+      }
+      if (platform === "bags") {
+        const [pda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
+          new PublicKey(BAGS)
+        );
+        return pda.toBase58();
+      }
+      if (platform === "letsbonk") {
+        const [pda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
+          new PublicKey(LETSBONK)
+        );
+        return pda.toBase58();
+      }
+      if (platform === "launchlab") {
+        // Raydium LaunchLab uses "launch-pool" seed
+        const [pda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("launch-pool"), new PublicKey(mint).toBuffer()],
+          new PublicKey(LAUNCHLAB)
+        );
+        return pda.toBase58();
+      }
+    } catch {}
+    return "";
   }
 
   // Parse name/symbol/uri from Pump.fun Create event
