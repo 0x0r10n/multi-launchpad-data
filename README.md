@@ -40,6 +40,38 @@ graph TD
 
 ---
 
+## 📡 WebSocket Rooms
+
+| Room | Event | Description | Payload Weight |
+|------|-------|-------------|----------------|
+| `new` | `message` / `update` | All new token launches + enrichment updates | Full |
+| `graduating` | `message` | Tokens reaching ≥ 80% bonding curve | Full |
+| `graduated` | `message` | Tokens that migrated to Raydium | Full |
+| `token:{mint}` | `message` / `trade` | Live updates for a specific token | Full + Trades |
+| `chart:{mint}` | `message` | Price ticks only (optimized for charts) | Lightweight |
+| `trending` | `message` | Top 20 tokens by 24h volume (every 60s) | Medium |
+
+### Frontend Connection
+```js
+import { io } from "socket.io-client";
+const socket = io("http://localhost:3000");
+
+// Join rooms
+socket.emit("join", "new");               // all new launches
+socket.emit("join", "graduating");        // tokens about to graduate
+socket.emit("join", "graduated");         // migrated tokens
+socket.emit("join", `token:${mint}`);     // specific token (full data + trades)
+socket.emit("join", `chart:${mint}`);     // specific token (price ticks only)
+socket.emit("join", "trending");          // top 20 by volume
+
+// Listen
+socket.on("message", (payload) => { /* full/chart/trending data */ });
+socket.on("update",  (payload) => { /* enrichment updates */ });
+socket.on("trade",   (data)    => { /* { mint, signature, type, solAmount } */ });
+```
+
+---
+
 ## 📦 Prerequisites
 
 - **Node.js**: 20+ (using `nvm` recommended)
@@ -175,6 +207,32 @@ Docker makes the app portable and easy to manage alongside Redis.
 | Enrichment Time | < 800ms |
 | Memory Usage | ~10 MB / 400 tokens |
 | Throughput | 3000+ txs/min |
+
+---
+
+## 🔍 DEX Analysis (Python Component)
+
+The repository includes a secondary **`dex_checker.py`** component designed for deep inspection of token listings on DexScreener.
+
+### Features
+- **Paid Status Verification**: Checks if a token has active paid marketing (Token Profile, Community Takeover, or Ads) via the DexScreener Orders API.
+- **Boost Tracking**: Monitors active and total boost counts to identify high-interest tokens.
+- **Media Extraction**: Automatically fetches banner, header, and profile images for verified tokens.
+- **Golden Status**: Identifies "Golden" tokens (those with ≥ 500 active boosts).
+- **Production-Ready**:
+  - **In-Memory Caching**: Intelligent TTL (1hr for paid status, 5min for dynamic boosts).
+  - **Rate Limit Handling**: Built-in exponential backoff and request throttling.
+  - **Thread-Safe**: Uses locking mechanisms for safe concurrent cache access.
+
+### Usage
+```python
+from dex_checker import DexChecker
+
+checker = DexChecker()
+info = checker.check_dex_info("solana", "TOKEN_ADDRESS")
+print(info) 
+# Returns: {'dex_paid': True, 'active_boosts': 520, 'banner_url': '...', 'show_golden': True}
+```
 
 ---
 

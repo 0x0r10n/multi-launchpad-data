@@ -64,6 +64,18 @@ function broadcastTrending(trendingList: any) {
   });
 }
 
+// Dedicated chart room — sends ONLY price history (lightweight for chart UIs)
+async function broadcastChartData(mint: string) {
+  try {
+    const history = await getPriceHistory(mint, 500);
+    io.to(`chart:${mint}`).emit("message", {
+      type: "chart",
+      room: `chart:${mint}`,
+      data: { mint, priceHistory: history }
+    });
+  } catch {}
+}
+
 // ========== EVENT HANDLERS ==========
 
 yellowstone.on("new-launch", async (data: any) => {
@@ -92,6 +104,7 @@ yellowstone.on("trade", async (data: any) => {
   // These will trigger a PUBSUB message which then broadcasts the full payload update
   queueCurveUpdate(data.mint);
   recordPrice(data.mint);
+  broadcastChartData(data.mint);  // lightweight chart-only update
 
   try {
     const createdAt = await redis.hget(`token:${data.mint}`, "createdAt");
