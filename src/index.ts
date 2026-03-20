@@ -33,16 +33,45 @@ startEnrichmentSweep();
 io.on("connection", (socket) => {
   socket.on("join", (room: string) => {
     socket.join(room);
+    console.log(`[WS] Client joined room: ${room}`);
   });
   // Auto-join "new" room
   socket.join("new");
 });
 
+// === ROOM BROADCAST HELPERS ===
+function broadcastNewToken(payload: any) {
+  io.to("new").emit("message", payload);
+}
+
+function broadcastGraduating(payload: any) {
+  io.to("graduating").emit("message", payload);
+}
+
+function broadcastGraduated(payload: any) {
+  io.to("graduated").emit("message", payload);
+}
+
+function broadcastTokenUpdate(mint: string, payload: any) {
+  io.to(`token:${mint}`).emit("message", payload);
+}
+
+function broadcastTrending(trendingList: any) {
+  io.to("trending").emit("message", {
+    type: "trending",
+    room: "trending",
+    data: trendingList
+  });
+}
+
 // ========== EVENT HANDLERS ==========
 
 yellowstone.on("new-launch", async (data: any) => {
   const payload = await buildTokenPayload(data);
-  io.to("new").emit("message", payload);
+  
+  broadcastNewToken(payload);           // "new" room
+  broadcastTokenUpdate(data.mint, payload); // individual token room
+  
   console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | ${data.mint.slice(0, 12)}...`);
 
   // Queue background enrichment (metadata from IPFS + bonding curve data)
@@ -52,11 +81,15 @@ yellowstone.on("new-launch", async (data: any) => {
 });
 
 yellowstone.on("trade", async (data: any) => {
+  // We don't build full payload here to save RPC/Redis usage
+  // Just emit the trade event to the specific token room
   io.to(`token:${data.mint}`).emit("trade", {
     mint: data.mint, signature: data.signature,
     type: data.type, solAmount: data.solAmount
   });
+  
   // Refresh curve data, record price tick, and recalc events on every trade
+  // These will trigger a PUBSUB message which then broadcasts the full payload update
   queueCurveUpdate(data.mint);
   recordPrice(data.mint);
 
@@ -88,14 +121,54 @@ subscriber.on("message", async (channel, mint) => {
       if (!d || !d.mint) return;
       
       const payload = await buildTokenPayload(d);
+      const status = payload.data.graduation.status;
 
+      // Broadcast to specific token room (REQUIRED for all updates)
+      broadcastTokenUpdate(mint, { ...payload, type: "update" });
+
+      // Broadcast to main "new" stream as an update
       io.to("new").emit("update", payload);
-      io.to(`token:${mint}`).emit("update", payload);
+
+      // Graduation-specific rooms
+      if (status === "graduating") {
+        broadcastGraduating(payload);
+      } else if (status === "graduated") {
+        broadcastGraduated(payload);
+      }
     } catch (e) {
       console.error("[Broadcast] Failed sending update for", mint);
     }
   }
 });
+
+// ========== TRENDING JOB ==========
+setInterval(async () => {
+  try {
+    const trendingList = await calculateTrendingTokens();
+    broadcastTrending(trendingList);
+  } catch (e: any) {
+    console.error("[Trending] Job failed:", e.message);
+  }
+}, 60000);
+
+async function calculateTrendingTokens() {
+  const mints = await redis.zrevrange("tokens:latest", 0, 100);
+  const payloads = await Promise.all(mints.map(async (mint) => {
+    const data = await redis.hgetall(`token:${mint}`);
+    if (!data || !data.mint) return null;
+    return await buildTokenPayload(data);
+  }));
+  
+  const valid = payloads.filter(p => p !== null);
+  // Sort by volume24h (normalized to USD if possible)
+  valid.sort((a: any, b: any) => {
+    const volA = a.data.pools[0]?.txns?.volume24h || 0;
+    const volB = b.data.pools[0]?.txns?.volume24h || 0;
+    return volB - volA;
+  });
+  
+  return valid.slice(0, 20);
+}
 
 // ========== API ENDPOINTS ==========
 
