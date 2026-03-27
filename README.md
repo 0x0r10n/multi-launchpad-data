@@ -1,36 +1,52 @@
-# sol-indexer (Yellowstone Geyser Multi-Launchpad Indexer)
+ (Yellowstone Geyser Multi-Launchpad Indexer)
 
-> Ultra-low-latency Solana token detection and enrichment pipeline for Pump.fun, using Yellowstone gRPC.
+> Ultra-low-latency Solana token detection and enrichment pipeline for multiple launchpads, using Yellowstone gRPC.
 
-This indexer provides real-time monitoring of new token launches and trades on Solana launchpads, starting with Pump.fun. It achieves sub-100ms detection and provides enriched metadata, risk analysis, and price tracking.
+Monitors new token launches and trades across **5 Solana launchpads** in real-time. Achieves sub-100ms detection and provides enriched metadata, risk analysis, price tracking, and WebSocket broadcasting.
 
 ---
 
-## 🚀 Features
+## Supported Launchpads
+
+| Platform | ID | Detection Method |
+|---|---|---|
+| Pump.fun | `pump` | Program ID in logs |
+| Moonshot / Moon.it | `moon` | Program ID in logs |
+| Bags.fm (Meteora DBC) | `bags` | Program ID + vanity mint (`*BAGS`) |
+| Meteora DBC (generic) | `meteora` | Program ID in logs |
+| LetsBonk.fun | `letsbonk` | LaunchLab program + PlatformConfig account |
+| Raydium LaunchLab | `launchlab` | LaunchLab program ID |
+
+---
+
+## Features
 
 - **Blazing Fast**: < 100ms detection from on-chain events via Yellowstone gRPC.
+- **Multi-Launchpad**: Single stream handles Pump, Moon, Bags, LetsBonk, and LaunchLab.
 - **Parallel Enrichment**: Metadata, bonding curve data, and risk analysis populated in 200-800ms.
-- **Real-Time Streaming**: WebSocket broadcasts for skeleton payloads (instant) and full updates (enriched).
-- **Price Tracking**: Per-trade price ticks and rolling price change events (1m to 24h).
-- **Comprehensive API**: REST endpoints for latest tokens and historical price data.
-- **Robust Architecture**: Uses Redis PUBSUB for decoupled, efficient broadcasting.
+- **Real-Time Streaming**: WebSocket broadcasts with instant snapshots on room join.
+- **Price Tracking**: Per-trade price ticks, rolling price change events (1m to 24h), and chart history.
+- **Trending**: Top 50 tokens by SOL volume across 4 time windows (1m, 5m, 30m, 1h), updated every 30s.
+- **Sniper Detection**: Any buy within the first 20s of launch is flagged as a sniper.
+- **Comprehensive API**: REST endpoints for tokens, price history, and stats.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph TD
     YG[Yellowstone gRPC] -->|PROCESSED| YM[yellowstone-manager.ts]
-    YM -->|Detects launches/trades| IDX[index.ts]
-    
+    YM -->|detectParser — 5 launchpads| LP[launchpads/]
+    LP -->|new-launch / trade| IDX[index.ts]
+
     IDX -->|WebSocket: skeleton| WS[Clients]
-    
+
     YM -->|Triggers| ENR[enricher.ts]
     YM -->|Triggers| CT[curve-tracker.ts]
     YM -->|Triggers| RSK[risk-analyzer.ts]
     YM -->|Triggers| PT[price-tracker.ts]
-    
+
     ENR & CT & RSK & PT -->|Background Updates| REDIS[(Redis)]
     REDIS -->|PUBSUB| IDX
     IDX -->|WebSocket: full update| WS
@@ -40,18 +56,21 @@ graph TD
 
 ---
 
-## 📡 WebSocket Rooms
+## WebSocket Rooms
 
-| Room | Event | Description | Payload Weight |
-|------|-------|-------------|----------------|
-| `new` | `message` / `update` | All new token launches + enrichment updates | Full |
-| `graduating` | `message` | Tokens reaching ≥ 80% bonding curve | Full |
-| `graduated` | `message` | Tokens that migrated to Raydium | Full |
-| `token:{mint}` | `message` / `trade` | Live updates for a specific token | Full + Trades |
-| `chart:{mint}` | `message` | Price ticks only (optimized for charts) | Lightweight |
-| `trending` | `message` | Top 20 tokens by 24h volume (every 60s) | Medium |
+| Room | Event | Description |
+|------|-------|-------------|
+| `new` | `message` / `update` | All new launches + enrichment updates |
+| `graduating` | `message` | Tokens at ≥ 80% bonding curve |
+| `graduated` | `message` | Tokens migrated to Raydium |
+| `token:{mint}` | `message` / `trade` | Live updates + trades for a specific token |
+| `chart:{mint}` | `message` | Price ticks only (optimized for charts) |
+| `trending` | `message` | Top 50 tokens by SOL volume across 4 windows |
+
+Joining a room immediately emits a `snapshot` event with current state — no need to wait for the next broadcast cycle.
 
 ### Frontend Connection
+
 ```js
 import { io } from "socket.io-client";
 const socket = io("http://localhost:3000");
@@ -62,17 +81,42 @@ socket.emit("join", "graduating");        // tokens about to graduate
 socket.emit("join", "graduated");         // migrated tokens
 socket.emit("join", `token:${mint}`);     // specific token (full data + trades)
 socket.emit("join", `chart:${mint}`);     // specific token (price ticks only)
-socket.emit("join", "trending");          // top 20 by volume
+socket.emit("join", "trending");          // top 50 by volume, 4 windows
 
 // Listen
-socket.on("message", (payload) => { /* full/chart/trending data */ });
-socket.on("update",  (payload) => { /* enrichment updates */ });
-socket.on("trade",   (data)    => { /* { mint, signature, type, solAmount } */ });
+socket.on("snapshot", ({ room, data }) => { /* initial state on join */ });
+socket.on("message",  (payload) => { /* full/chart/trending data */ });
+socket.on("update",   (payload) => { /* enrichment updates */ });
+socket.on("trade",    (data)    => { /* { mint, signature, type, solAmount } */ });
+```
+
+### Trending Payload
+
+```js
+// trending message.data shape:
+{
+  "1m":  [ ...top50 ],  // by SOL volume in last 1 minute
+  "5m":  [ ...top50 ],  // by SOL volume in last 5 minutes
+  "30m": [ ...top50 ],  // by SOL volume in last 30 minutes
+  "1h":  [ ...top50 ],  // by SOL volume in last 1 hour
+}
 ```
 
 ---
 
-## 📦 Prerequisites
+## REST Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/new` | Latest 50 tokens (full payload) |
+| `GET` | `/api/token/:mint` | Single token full payload |
+| `GET` | `/api/token/:mint/history` | Price history (`?limit=200`) |
+| `GET` | `/api/stats` | Stream stats (token count, uptime) |
+| `GET` | `/` | HTML dashboard (latest 20 tokens, auto-refreshes) |
+
+---
+
+## Prerequisites
 
 - **Node.js**: 20+ (using `nvm` recommended)
 - **Redis**: 7+ installed and running
@@ -81,128 +125,120 @@ socket.on("trade",   (data)    => { /* { mint, signature, type, solAmount } */ }
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ```bash
-git clone https://github.com/your-org/sol-indexer.git
-cd sol-indexer
+git clone https://github.com/wave745/multi-launchpad-data
+cd multi-launchpad-data
 npm install
 ```
 
 ### Environment Setup
+
 Create a `.env` file in the root:
+
 ```env
 REDIS_URL=redis://localhost:6379
 SOLANA_RPC=https://your-rpc-endpoint
-YELLOWSTONE_ENDPOINT=https://your-yellowstone-grpc:443
-YELLOWSTONE_TOKEN=your-auth-token
-PORT=3000
+CHAINSTACK_GEYSER_URL=https://yellowstone-solana-mainnet.core.chainstack.com
+CHAINSTACK_GEYSER_TOKEN=your-auth-token
+```
+
+### Running
+
+```bash
+npm start
+# → API: http://localhost:3000
 ```
 
 ---
 
-## 🚢 Deployment Guide
+## Deployment
 
-This section explains how to keep the indexer running 24/7 on a production server.
+### Option 1: PM2 (Recommended — Quick & Simple)
 
-### Option 1: PM2 (Recommended - Quick & Simple)
+```bash
+sudo npm install -g pm2
+pm2 start "npm start" --name sol-indexer
+pm2 startup && pm2 save
+```
 
-PM2 is a Node.js process manager. It keeps the app running forever, auto-restarts on crash, and survives server reboots.
+Or use an `ecosystem.config.js`:
 
-1. **Install PM2 globally**
-   ```bash
-   sudo npm install -g pm2
-   ```
+```js
+module.exports = {
+  apps: [{
+    name: "sol-indexer",
+    script: "src/index.ts",
+    interpreter: "tsx",
+    instances: 1,
+    autorestart: true,
+    max_memory_restart: "2G",
+    env_production: { NODE_ENV: "production" }
+  }]
+};
+```
 
-2. **Start the indexer**
-   Directly using `tsx`:
-   ```bash
-   pm2 start "npm start" --name sol-indexer
-   ```
-   *Or use an `ecosystem.config.js` for more control:*
-   ```js
-   module.exports = {
-     apps: [{
-       name: "sol-indexer",
-       script: "src/index.ts",
-       interpreter: "tsx",
-       instances: 1,
-       autorestart: true,
-       max_memory_restart: "2G",
-       env_production: {
-         NODE_ENV: "production"
-       }
-     }]
-   };
-   ```
+Monitoring:
 
-3. **Persistence**
-   ```bash
-   pm2 startup
-   # Run the command generated by pm2 startup
-   pm2 save
-   ```
+```bash
+pm2 status
+pm2 logs sol-indexer
+pm2 monit
+```
 
-4. **Monitoring**
-   ```bash
-   pm2 status
-   pm2 logs sol-indexer
-   pm2 monit
-   ```
+### Option 2: Docker
 
-### Option 2: Docker (Recommended for Scale)
+**`Dockerfile`**:
 
-Docker makes the app portable and easy to manage alongside Redis.
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm install -g tsx
+EXPOSE 3000
+CMD ["tsx", "src/index.ts"]
+```
 
-1. **Create `Dockerfile`**
-   ```dockerfile
-   FROM node:20-alpine
-   WORKDIR /app
-   COPY package*.json ./
-   RUN npm install
-   COPY . .
-   RUN npm install -g tsx
-   EXPOSE 3000
-   CMD ["tsx", "src/index.ts"]
-   ```
+**`docker-compose.yml`**:
 
-2. **Create `docker-compose.yml`**
-   ```yaml
-   version: '3.8'
-   services:
-     indexer:
-       build: .
-       restart: always
-       ports:
-         - "3000:3000"
-       environment:
-         - NODE_ENV=production
-         - REDIS_URL=redis://redis:6379
-         - SOLANA_RPC=${SOLANA_RPC}
-         - YELLOWSTONE_ENDPOINT=${YELLOWSTONE_ENDPOINT}
-         - YELLOWSTONE_TOKEN=${YELLOWSTONE_TOKEN}
-       depends_on:
-         - redis
-     redis:
-       image: redis:7-alpine
-       restart: always
-       volumes:
-         - redis-data:/data
-   volumes:
-     redis-data:
-   ```
+```yaml
+version: '3.8'
+services:
+  indexer:
+    build: .
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - SOLANA_RPC=${SOLANA_RPC}
+      - CHAINSTACK_GEYSER_URL=${CHAINSTACK_GEYSER_URL}
+      - CHAINSTACK_GEYSER_TOKEN=${CHAINSTACK_GEYSER_TOKEN}
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis-data:/data
+volumes:
+  redis-data:
+```
 
-3. **Launch**
-   ```bash
-   docker compose up -d --build
-   ```
+```bash
+docker compose up -d --build
+```
 
 ---
 
-## 📈 Performance Benchmarks
+## Performance Benchmarks
 
 | Metric | Target |
-|--------|-------|
+|--------|--------|
 | Detection Latency | < 100ms |
 | Enrichment Time | < 800ms |
 | Memory Usage | ~10 MB / 400 tokens |
@@ -210,7 +246,7 @@ Docker makes the app portable and easy to manage alongside Redis.
 
 ---
 
-## 🔍 DEX Analysis (Python Component)
+## DEX Analysis (Python Component)
 
 The repository includes a secondary **`dex_checker.py`** component designed for deep inspection of token listings on DexScreener.
 
@@ -230,11 +266,12 @@ from dex_checker import DexChecker
 
 checker = DexChecker()
 info = checker.check_dex_info("solana", "TOKEN_ADDRESS")
-print(info) 
+print(info)
 # Returns: {'dex_paid': True, 'active_boosts': 520, 'banner_url': '...', 'show_golden': True}
 ```
 
 ---
 
-## 🛡️ License
+## License
+
 ISC License. See `package.json`.

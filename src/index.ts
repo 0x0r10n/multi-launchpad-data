@@ -3,7 +3,7 @@ import express from "express";
 import { Server } from "socket.io";
 import { YellowstoneManager } from "./yellowstone-manager";
 import { queueEnrichment, startEnrichmentSweep } from "./enricher";
-import { queueCurveUpdate, startCurveRefreshLoop } from "./curve-tracker";
+import { queueCurveUpdate, startCurveRefreshLoop, fetchAndDecodeCurve } from "./curve-tracker";
 import { startPriceTracker, getPriceHistory, recordPrice, calcPriceEvents } from "./price-tracker";
 import { queueRiskAnalysis, startRiskAnalysisLoop } from "./risk-analyzer";
 import Redis from "ioredis";
@@ -31,12 +31,51 @@ startEnrichmentSweep();
 
 // ========== WEBSOCKET ROOMS ==========
 io.on("connection", (socket) => {
-  socket.on("join", (room: string) => {
-    socket.join(room);
-    console.log(`[WS] Client joined room: ${room}`);
-  });
-  // Auto-join "new" room
+  // Auto-join "new" room — client gets future new-launch events immediately
   socket.join("new");
+
+  socket.on("join", async (room: string) => {
+    socket.join(room);
+
+    // Send current state immediately so clients don't wait for the next broadcast cycle
+    try {
+      if (room === "graduating") {
+        const tokens = await getTokensByStatus("graduating");
+        socket.emit("snapshot", { type: "snapshot", room: "graduating", data: tokens });
+
+      } else if (room === "graduated") {
+        const tokens = await getTokensByStatus("graduated");
+        socket.emit("snapshot", { type: "snapshot", room: "graduated", data: tokens });
+
+      } else if (room === "trending") {
+        const trendingList = await calculateTrendingTokens();
+        socket.emit("snapshot", { type: "snapshot", room: "trending", data: trendingList });
+
+      } else if (room.startsWith("chart:")) {
+        const mint = room.slice(6);
+        if (mint) {
+          const history = await getPriceHistory(mint, 500);
+          socket.emit("snapshot", {
+            type: "snapshot",
+            room,
+            data: { mint, priceHistory: history },
+          });
+        }
+
+      } else if (room.startsWith("token:")) {
+        const mint = room.slice(6);
+        if (mint) {
+          const d = await redis.hgetall(`token:${mint}`);
+          if (d?.mint) {
+            const payload = await buildTokenPayload(d, true);
+            socket.emit("snapshot", { type: "snapshot", room, data: payload });
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error(`[WS] Snapshot failed for room ${room}:`, e.message);
+    }
+  });
 });
 
 // === ROOM BROADCAST HELPERS ===
@@ -56,22 +95,26 @@ function broadcastTokenUpdate(mint: string, payload: any) {
   io.to(`token:${mint}`).emit("message", payload);
 }
 
-function broadcastTrending(trendingList: any) {
+function broadcastTrending(trendingData: Record<string, any[]>) {
   io.to("trending").emit("message", {
     type: "trending",
     room: "trending",
-    data: trendingList
+    data: trendingData,  // { "1m": [...], "5m": [...], "30m": [...], "1h": [...] }
   });
 }
 
-// Dedicated chart room — sends ONLY price history (lightweight for chart UIs)
-async function broadcastChartData(mint: string) {
+// Dedicated chart room — emits only the latest tick (full history served via REST)
+async function broadcastChartTick(mint: string) {
   try {
-    const history = await getPriceHistory(mint, 500);
+    const [priceQuote, priceUsd] = await redis.hmget(`token:${mint}`, "priceQuote", "priceUsd");
+    if (!priceQuote) return;
     io.to(`chart:${mint}`).emit("message", {
       type: "chart",
       room: `chart:${mint}`,
-      data: { mint, priceHistory: history }
+      data: {
+        mint,
+        tick: { time: Date.now(), price: parseFloat(priceQuote), price_usd: parseFloat(priceUsd || "0") },
+      },
     });
   } catch {}
 }
@@ -79,17 +122,28 @@ async function broadcastChartData(mint: string) {
 // ========== EVENT HANDLERS ==========
 
 yellowstone.on("new-launch", async (data: any) => {
-  const payload = await buildTokenPayload(data);
-  
-  broadcastNewToken(payload);           // "new" room
-  broadcastTokenUpdate(data.mint, payload); // individual token room
-  
-  console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | ${data.mint.slice(0, 12)}...`);
+  // Fetch bonding curve inline — price/liquidity/curvePercentage in the first broadcast.
+  // Falls back gracefully (fields stay 0) if the account isn't readable yet.
+  if (data.curvePDA) {
+    const curveFields = await fetchAndDecodeCurve(data.mint, data.curvePDA, data.platform || "pump");
+    if (curveFields) {
+      Object.assign(data, curveFields);
+      // Persist curve fields async — don't block the broadcast
+      redis.hset(`token:${data.mint}`, curveFields).catch(() => {});
+    }
+  }
 
-  // Queue background enrichment (metadata from IPFS + bonding curve data)
+  // New tokens have no price history — pass [] directly to skip the Redis lrange call
+  const payload = await buildTokenPayload(data, false, []);
+  broadcastNewToken(payload);
+  broadcastTokenUpdate(data.mint, payload);
+
+  console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | price=${parseFloat(data.priceUsd || "0").toFixed(8)} | ${data.mint.slice(0, 12)}...`);
+
+  // Background: image/socials (IPFS — slow, non-blocking) and risk (RPC-heavy)
   queueEnrichment(data.mint);
-  queueCurveUpdate(data.mint);
   queueRiskAnalysis(data.mint);
+  // Note: curve already fetched inline above. Trade events drive future curve updates.
 });
 
 yellowstone.on("trade", async (data: any) => {
@@ -104,7 +158,7 @@ yellowstone.on("trade", async (data: any) => {
   // These will trigger a PUBSUB message which then broadcasts the full payload update
   queueCurveUpdate(data.mint);
   recordPrice(data.mint);
-  broadcastChartData(data.mint);  // lightweight chart-only update
+  broadcastChartTick(data.mint);
 
   try {
     const createdAt = await redis.hget(`token:${data.mint}`, "createdAt");
@@ -132,7 +186,10 @@ subscriber.on("message", async (channel, mint) => {
     try {
       const d = await redis.hgetall(`token:${mint}`);
       if (!d || !d.mint) return;
-      
+
+      // Bust the payload cache so the next build is always fresh
+      await redis.del(`payload:${mint}`);
+
       const payload = await buildTokenPayload(d);
       const status = payload.data.graduation.status;
 
@@ -154,33 +211,119 @@ subscriber.on("message", async (channel, mint) => {
   }
 });
 
+// ========== HELPERS ==========
+
+// Scan tokens:latest and return full payloads for a given graduationStatus.
+// Uses a Redis pipeline so N tokens = 1 roundtrip for the status filter.
+async function getTokensByStatus(status: string): Promise<any[]> {
+  const mints = await redis.zrevrange("tokens:latest", 0, 199);
+  if (!mints.length) return [];
+
+  const pipeline = redis.pipeline();
+  for (const mint of mints) pipeline.hget(`token:${mint}`, "graduationStatus");
+  const results = await pipeline.exec();
+
+  const matchingMints = mints.filter((_, i) => results?.[i]?.[1] === status);
+  if (!matchingMints.length) return [];
+
+  const tokenDatas = await Promise.all(matchingMints.map(m => redis.hgetall(`token:${m}`)));
+  const payloads = await Promise.all(
+    tokenDatas.filter(d => d?.mint).map(d => buildTokenPayload(d)),
+  );
+  return payloads;
+}
+
 // ========== TRENDING JOB ==========
+// Runs every 30s — 1m window needs more frequent refreshes than 60s
 setInterval(async () => {
   try {
-    const trendingList = await calculateTrendingTokens();
-    broadcastTrending(trendingList);
+    const trendingData = await calculateTrendingTokens();
+    broadcastTrending(trendingData);
   } catch (e: any) {
     console.error("[Trending] Job failed:", e.message);
   }
-}, 60000);
+}, 30_000);
 
-async function calculateTrendingTokens() {
-  const mints = await redis.zrevrange("tokens:latest", 0, 100);
-  const payloads = await Promise.all(mints.map(async (mint) => {
-    const data = await redis.hgetall(`token:${mint}`);
-    if (!data || !data.mint) return null;
-    return await buildTokenPayload(data);
+const TRENDING_WINDOWS: Record<string, number> = {
+  "1m":  60_000,
+  "5m":  300_000,
+  "30m": 1_800_000,
+  "1h":  3_600_000,
+};
+
+// Returns { "1m": [...top50], "5m": [...top50], "30m": [...top50], "1h": [...top50] }
+// One pipeline call to fetch all trade data, then volume is computed in-memory per window.
+async function calculateTrendingTokens(): Promise<Record<string, any[]>> {
+  const empty = { "1m": [], "5m": [], "30m": [], "1h": [] };
+  const mints = await redis.zrevrange("tokens:latest", 0, 199);
+  if (!mints.length) return empty;
+
+  const now = Date.now();
+  const cutoff1h = now - 3_600_000; // fetch trades up to 1h — covers all 4 windows
+
+  // Single pipeline roundtrip: get all trades within 1h for every mint
+  const pipeline = redis.pipeline();
+  for (const mint of mints) {
+    pipeline.zrangebyscore(`trades:${mint}`, cutoff1h, "+inf");
+  }
+  const pipelineResults = await pipeline.exec();
+
+  // Compute per-window volume for each mint from the in-memory trade entries
+  // Trade member format: "buy|sell:{solAmount}:{timestamp}"
+  const mintVolumes: Record<string, Record<string, number>> = {};
+
+  for (let i = 0; i < mints.length; i++) {
+    const mint = mints[i];
+    const entries: string[] = (pipelineResults?.[i]?.[1] as string[]) || [];
+    const vol: Record<string, number> = { "1m": 0, "5m": 0, "30m": 0, "1h": 0 };
+
+    for (const entry of entries) {
+      const parts = entry.split(":");
+      const sol = parseFloat(parts[1] || "0");
+      const ts  = parseInt(parts[2]  || "0");
+      if (!sol || !ts) continue;
+
+      const age = now - ts;
+      if (age <= 60_000)    vol["1m"]  += sol;
+      if (age <= 300_000)   vol["5m"]  += sol;
+      if (age <= 1_800_000) vol["30m"] += sol;
+      vol["1h"] += sol;
+    }
+
+    mintVolumes[mint] = vol;
+  }
+
+  // Rank mints per window and take top 50
+  const windowRankings: Record<string, string[]> = {};
+  const neededMints = new Set<string>();
+
+  for (const window of Object.keys(TRENDING_WINDOWS)) {
+    const ranked = mints
+      .filter(m => (mintVolumes[m]?.[window] || 0) > 0)
+      .sort((a, b) => (mintVolumes[b][window] || 0) - (mintVolumes[a][window] || 0))
+      .slice(0, 50);
+    windowRankings[window] = ranked;
+    for (const m of ranked) neededMints.add(m);
+  }
+
+  // Fetch token data for all unique mints that appear in any window — deduplicated
+  const uniqueMints = [...neededMints];
+  const tokenDatas = await Promise.all(uniqueMints.map(m => redis.hgetall(`token:${m}`)));
+
+  const payloadMap = new Map<string, any>();
+  await Promise.all(uniqueMints.map(async (m, i) => {
+    const d = tokenDatas[i];
+    if (d?.mint) payloadMap.set(m, await buildTokenPayload(d));
   }));
-  
-  const valid = payloads.filter(p => p !== null);
-  // Sort by volume24h (normalized to USD if possible)
-  valid.sort((a: any, b: any) => {
-    const volA = a.data.pools[0]?.txns?.volume24h || 0;
-    const volB = b.data.pools[0]?.txns?.volume24h || 0;
-    return volB - volA;
-  });
-  
-  return valid.slice(0, 20);
+
+  // Assemble final result
+  const result: Record<string, any[]> = {};
+  for (const window of Object.keys(TRENDING_WINDOWS)) {
+    result[window] = windowRankings[window]
+      .map(m => payloadMap.get(m))
+      .filter(Boolean);
+  }
+  return result;
 }
 
 // ========== API ENDPOINTS ==========
@@ -194,8 +337,8 @@ app.get("/new", async (_req, res) => {
     const hashes = await Promise.all(mints.map(m => redis.hgetall(`token:${m}`)));
     const validHashes = hashes.filter(d => d && d.mint);
     
-    // Build all payloads in parallel
-    const tokens = await Promise.all(validHashes.map(d => buildTokenPayload(d)));
+    // Build all payloads in parallel (REST always bypasses cache for freshness)
+    const tokens = await Promise.all(validHashes.map(d => buildTokenPayload(d, true)));
 
     res.json(tokens);
   } catch (e: any) {
@@ -210,7 +353,7 @@ app.get("/api/token/:mint", async (req, res) => {
     if (!d || Object.keys(d).length === 0) {
       return res.status(404).json({ error: "Token not found" });
     }
-    const payload = await buildTokenPayload(d);
+    const payload = await buildTokenPayload(d, true);
     res.json(payload);
   } catch (e: any) {
     res.status(500).json({ error: e.message });
@@ -289,15 +432,30 @@ app.get("/", async (_req, res) => {
 
 // ========== PAYLOAD BUILDER ==========
 
-async function buildTokenPayload(d: Record<string, string>): Promise<any> {
-  const createdAt = parseInt(d.createdAt || Date.now().toString());
+// Short-lived payload cache (2s TTL) — avoids rebuilding on rapid successive pubsub messages.
+// The pubsub handler busts this before calling buildTokenPayload, so workers always get fresh data.
+// REST endpoints always bypass the cache by passing forceRebuild=true.
+async function buildTokenPayload(
+  d: Record<string, string>,
+  forceRebuild = false,
+  priceHistoryOverride?: any[],
+): Promise<any> {
   const mint = d.mint || "";
+
+  if (!forceRebuild && mint) {
+    const cached = await redis.get(`payload:${mint}`);
+    if (cached) return JSON.parse(cached);
+  }
+
+  const createdAt = parseInt(d.createdAt || Date.now().toString());
   const platform = d.platform || "pump";
 
-  // Fetch price history inline so every broadcast includes it
-  const priceHistory = mint ? await getPriceHistory(mint, 50) : [];
+  // Use provided history (e.g. [] for new tokens) or fetch from Redis
+  const priceHistory = priceHistoryOverride !== undefined
+    ? priceHistoryOverride
+    : (mint ? await getPriceHistory(mint, 50) : []);
 
-  return {
+  const payload = {
     type: "message",
     room: "new",
     data: {
@@ -399,6 +557,11 @@ async function buildTokenPayload(d: Record<string, string>): Promise<any> {
       priceHistory
     }
   };
+
+  // Cache for 10 seconds — busted by the pubsub handler before each worker update.
+  // Longer TTL helps trending calc and repeated WebSocket snapshot requests.
+  if (mint) await redis.setex(`payload:${mint}`, 10, JSON.stringify(payload));
+  return payload;
 }
 
 function safeParse(json: string | undefined, fallback: any): any {
