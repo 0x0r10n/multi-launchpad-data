@@ -271,7 +271,3 @@ print(info)
 ```
 
 ---
-
-## License
-
-ISC License. See `package.json`.
