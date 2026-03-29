@@ -382,53 +382,7 @@ app.get("/api/stats", async (_req, res) => {
   });
 });
 
-// GET / — simple HTML dashboard
-app.get("/", async (_req, res) => {
-  const mints = await redis.zrevrange("tokens:latest", 0, 19);
-  const tokens: any[] = [];
-  for (const mint of mints) {
-    const data = await redis.hgetall(`token:${mint}`);
-    if (data?.mint) tokens.push(data);
-  }
 
-  const rows = tokens.map(t =>
-    `<tr>
-      <td><a href="/api/token/${t.mint}" style="color:#0f0">${t.mint?.slice(0,16)}...</a></td>
-      <td>${t.name || 'Unknown'}</td>
-      <td>${t.symbol || '???'}</td>
-      <td>${t.creator?.slice(0,12)}...</td>
-      <td>${t.createdAt ? new Date(parseInt(t.createdAt)).toLocaleTimeString() : '-'}</td>
-    </tr>`
-  ).join("");
-
-  const total = await redis.zcard("tokens:latest");
-
-  res.send(`
-    <html>
-    <head><title>Pump.fun Live Tracker</title>
-    <style>
-      body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
-      h1 { color: #0ff; }
-      table { border-collapse: collapse; width: 100%; }
-      th, td { border: 1px solid #333; padding: 8px; text-align: left; }
-      th { background: #222; color: #0ff; }
-      tr:hover { background: #1a1a1a; }
-      .stats { color: #ff0; margin-bottom: 20px; }
-      a { text-decoration: none; }
-    </style>
-    </head>
-    <body>
-      <h1>🚀 Pump.fun Live Tracker</h1>
-      <div class="stats">Total Tokens: ${total} | Showing latest 20 | <a href="/new" style="color:#0ff">/new (JSON)</a> | <a href="/api/stats" style="color:#0ff">/api/stats</a></div>
-      <table>
-        <tr><th>Mint</th><th>Name</th><th>Symbol</th><th>Creator</th><th>Time</th></tr>
-        ${rows}
-      </table>
-      <script>setTimeout(() => location.reload(), 5000);</script>
-    </body>
-    </html>
-  `);
-});
 
 // ========== PAYLOAD BUILDER ==========
 
