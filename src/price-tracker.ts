@@ -1,6 +1,7 @@
 // src/price-tracker.ts — Price ticks on every trade + rolling price change events
 import Redis from "ioredis";
 import "dotenv/config";
+import { addPriceTick } from "./price-utils";
 
 const redis = new Redis(process.env.REDIS_URL!);
 
@@ -27,14 +28,11 @@ export async function recordPrice(mint: string) {
   const now = Date.now();
 
   // Store tick in a Redis list for fast retrieval (newest at end)
-  await redis.rpush(`price:${mint}`, JSON.stringify({
+  await addPriceTick(mint, {
     time: now,
     price: pq,
     price_usd: pu,
-  }));
-
-  // Keep only last 500 ticks to avoid unbounded growth
-  await redis.ltrim(`price:${mint}`, -500, -1);
+  });
 
   // Also recalculate price change events immediately on this trade
   await calcPriceEvents(mint);
@@ -110,3 +108,4 @@ export function startPriceTracker() {
 
   console.log("[PriceTracker] Started — snapshots every 30s for top 50 tokens");
 }
+
