@@ -1,30 +1,19 @@
 // src/curve-tracker.ts — Bonding curve data: liquidity, price, marketCap, curvePercentage
+// Ongoing curve updates are pushed via Geyser account subscriptions.
+// fetchAndDecodeCurve() is a ONE-TIME call used only for the initial launch broadcast.
 import { Connection, PublicKey } from "@solana/web3.js";
 import Redis from "ioredis";
 import "dotenv/config";
 
 import { getParser, CurveState } from "./launchpads";
 
+const connection = new Connection(process.env.SOLANA_RPC!, "processed");
+
 const redis      = new Redis(process.env.REDIS_URL!);
-const connection = new Connection(process.env.SOLANA_RPC!, "confirmed");
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 const TOKEN_DECIMALS   = 6;
 const TOTAL_SUPPLY     = 1_000_000_000;
-
-// ── Debounce map: prevents RPC hammering on hot tokens ──────────────────────
-const pendingCurveUpdates = new Map<string, ReturnType<typeof setTimeout>>();
-const DEBOUNCE_MS = 300;
-
-export function queueCurveUpdate(mint: string) {
-  const existing = pendingCurveUpdates.get(mint);
-  if (existing) clearTimeout(existing);
-  const t = setTimeout(() => {
-    pendingCurveUpdates.delete(mint);
-    updateCurveData(mint).catch(() => {});
-  }, DEBOUNCE_MS);
-  pendingCurveUpdates.set(mint, t);
-}
 
 // ── Volume 24h with in-memory cache (10s TTL) ────────────────────────────────
 const vol24hCache = new Map<string, { value: number; ts: number }>();
@@ -44,7 +33,6 @@ async function calcVolume24h(mint: string, cutoff: number): Promise<number> {
 }
 
 // ── Curve decoding: delegated entirely to the launchpad parser registry ───────
-// Each parser owns its own layout — no if/else chains here.
 function decodeCurveAccount(data: Buffer, platform: string): CurveState | null {
   return getParser(platform)?.parseCurveData(data) ?? null;
 }
@@ -90,94 +78,69 @@ async function buildCurveUpdate(
   };
 }
 
-// ── Inline fetch for new-launch handler (no debounce, no queue) ──────────────
-// Fetches and decodes the bonding curve immediately so the first broadcast
-// includes price/liquidity/curvePercentage instead of zeros.
+// ── RPC curve probe with configurable timeout ─────────────────────────────────
+// Used in two roles:
+//   - Fast probe (150ms) at launch, racing against Geyser first snapshot
+//   - Fallback (800ms default) if Geyser never delivers
+// New token has no trade history — passes empty tokenData (volume = 0).
 export async function fetchAndDecodeCurve(
   mint: string,
   curvePDA: string,
   platform: string,
+  timeoutMs = 800,
 ): Promise<Record<string, string> | null> {
   try {
-    // "processed" matches Yellowstone's commitment level — account is live by the time we ask
-    const [accountInfo, solPrice] = await Promise.all([
-      connection.getAccountInfo(new PublicKey(curvePDA), "processed"),
-      getSolPrice(),
-    ]);
-    if (!accountInfo?.data) return null;
-
-    const decoded = decodeCurveAccount(Buffer.from(accountInfo.data), platform);
-    if (!decoded) return null;
-
-    // New token has no trade history yet — pass empty tokenData (volume = 0)
-    return await buildCurveUpdate(mint, decoded, {}, solPrice);
+    const rpc = (async () => {
+      const [accountInfo, solPrice] = await Promise.all([
+        connection.getAccountInfo(new PublicKey(curvePDA), "processed"),
+        getSolPrice(),
+      ]);
+      if (!accountInfo?.data) return null;
+      const decoded = decodeCurveAccount(Buffer.from(accountInfo.data), platform);
+      if (!decoded) return null;
+      return await buildCurveUpdate(mint, decoded, {}, solPrice);
+    })();
+    const timeout = new Promise<null>(r => setTimeout(() => r(null), timeoutMs));
+    return await Promise.race([rpc, timeout]);
   } catch {
     return null;
   }
 }
 
-// ── Single-token update (trade-triggered, after debounce) ────────────────────
-async function updateCurveData(mint: string) {
-  const tokenData = await redis.hgetall(`token:${mint}`);
-  if (!tokenData?.curvePDA) return;
+// ── Geyser-pushed curve update (replaces all periodic RPC-based curve fetching) ─
+// Returns the update fields so callers can check completion state without an extra Redis read.
+// Handles the race where the token hasn't been written to Redis yet (first push at launch):
+// in that case we still decode and return the fields — the new-launch handler persists them.
+export async function processCurveAccountUpdate(
+  mint: string,
+  data: Buffer,
+  platform: string,
+): Promise<Record<string, string> | null> {
+  const decoded = decodeCurveAccount(data, platform);
+  if (!decoded) return null;
 
-  const accountInfo = await connection.getAccountInfo(new PublicKey(tokenData.curvePDA));
-  if (!accountInfo?.data) return;
-
-  const platform = tokenData.platform || "pump";
-  const decoded = decodeCurveAccount(Buffer.from(accountInfo.data), platform);
-  if (!decoded) return;
-
-  const solPrice = await getSolPrice();
-  const update = await buildCurveUpdate(mint, decoded, tokenData, solPrice);
-  await redis.hset(`token:${mint}`, update);
-  await redis.publish("token-updates", mint);
-}
-
-// ── Batch update for the sweep loop: 1 RPC call for all curve accounts ────────
-async function batchUpdateCurves(tokens: { mint: string; tokenData: Record<string, string> }[]) {
-  const curveKeys = tokens.map(t => new PublicKey(t.tokenData.curvePDA));
-
-  // Single RPC call + SOL price fetch in parallel
-  const [accountInfos, solPrice] = await Promise.all([
-    connection.getMultipleAccountsInfo(curveKeys),
+  const [tokenData, solPrice] = await Promise.all([
+    redis.hgetall(`token:${mint}`),
     getSolPrice(),
   ]);
 
-  await Promise.all(tokens.map(async ({ mint, tokenData }, i) => {
-    const info = accountInfos[i];
-    if (!info?.data) return;
+  // Use empty tokenData if token isn't in Redis yet (first push race) — volume will be 0 which is correct
+  const td = (tokenData?.mint ? tokenData : {}) as Record<string, string>;
+  const update = await buildCurveUpdate(mint, decoded, td, solPrice);
 
-    const platform = tokenData.platform || "pump";
-    const decoded = decodeCurveAccount(Buffer.from(info.data), platform);
-    if (!decoded) return;
+  // Graduation transition — only when token exists in Redis
+  if (td.creator && update.complete === "true" && td.complete !== "true") {
+    redis.hincrby(`creator:${td.creator}`, "migrated", 1).catch(() => {});
+  }
 
-    const update = await buildCurveUpdate(mint, decoded, tokenData, solPrice);
+  if (tokenData?.mint) {
     await redis.hset(`token:${mint}`, update);
     await redis.publish("token-updates", mint);
-  }));
-}
-
-// ── Sweep loop: batch-refresh active tokens every 30s ────────────────────────
-export function startCurveRefreshLoop() {
-  setInterval(async () => {
-    try {
-      const mints = await redis.zrevrange("tokens:latest", 0, 19);
-      const tokenDatas = await Promise.all(mints.map(m => redis.hgetall(`token:${m}`)));
-
-      const active = mints
-        .map((mint, i) => ({ mint, tokenData: tokenDatas[i] }))
-        .filter(({ tokenData }) => tokenData?.curvePDA && tokenData.complete !== "true");
-
-      if (active.length > 0) await batchUpdateCurves(active);
-    } catch (e: any) {
-      console.error("[CurveTracker] Refresh error:", e.message);
-    }
-  }, 30_000);
+  }
+  return update;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
 
 let cachedSolPrice = 0;
 let solPriceLastFetch = 0;

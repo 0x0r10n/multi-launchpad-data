@@ -24,6 +24,10 @@ export class YellowstoneManager extends EventEmitter {
   private msgCount = 0;
   private txCount  = 0;
 
+  // curvePDA (base58) → { mint, platform } — drives Geyser account subscriptions
+  private curveAccounts = new Map<string, { mint: string; platform: string }>();
+  private subDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
   async start() {
     if (this.reconnecting) return;
     console.log("[Yellowstone] Connecting...");
@@ -38,10 +42,101 @@ export class YellowstoneManager extends EventEmitter {
       this.stream = await client.subscribe();
       console.log("[Yellowstone] Stream opened.");
       this.setupStream();
-      this.subscribeToLaunchpads();
+      // Immediate write: subscribe to launchpad transactions right away (with 0 PDAs).
+      // restoreCurveSubscriptions will call sendFullSubscription again once PDAs are loaded,
+      // which updates the accounts filter. Two writes on startup is fine and correct.
+      this.sendFullSubscription();
+      this.restoreCurveSubscriptions().catch(() => {});
     } catch (err: any) {
       console.error("[Yellowstone] Connect fail:", err.message);
       this.handleReconnect();
+    }
+  }
+
+  // ── Public API for managing curve PDA subscriptions ─────────────────────────
+
+  public addCurvePDA(curvePDA: string, mint: string, platform: string) {
+    // Chainstack limit: 50 accounts per stream subscription.
+    // When at capacity, evict the oldest entry (Map preserves insertion order).
+    if (!this.curveAccounts.has(curvePDA) && this.curveAccounts.size >= 50) {
+      const oldest = this.curveAccounts.keys().next().value;
+      if (oldest) this.curveAccounts.delete(oldest);
+    }
+    this.curveAccounts.set(curvePDA, { mint, platform });
+    this.scheduleSubscriptionUpdate();
+  }
+
+  public removeCurvePDA(curvePDA: string) {
+    this.curveAccounts.delete(curvePDA);
+    this.scheduleSubscriptionUpdate();
+  }
+
+  // ── Private subscription management ─────────────────────────────────────────
+
+  private scheduleSubscriptionUpdate() {
+    if (this.subDebounceTimer) clearTimeout(this.subDebounceTimer);
+    // 20ms debounce — batches rapid launches while minimizing Geyser registration lag
+    this.subDebounceTimer = setTimeout(() => {
+      this.subDebounceTimer = null;
+      this.sendFullSubscription();
+    }, 20);
+  }
+
+  // ── Single combined subscription write ───────────────────────────────────────
+  // CRITICAL: every stream.write() is a full replacement of that subscription type.
+  // An empty transactions:{} wipes the launchpad tx subscription. We must include
+  // BOTH the transaction filter AND the account filter in every write.
+  private sendFullSubscription() {
+    if (!this.stream || this.reconnecting) return;
+    const pdas = [...this.curveAccounts.keys()];
+    const req: any = {
+      // Empty account list with no owner/filters = "subscribe to ALL accounts" → not allowed.
+      // When there are no PDAs to track, omit the curve-pdas label entirely (accounts: {}).
+      accounts: pdas.length > 0
+        ? { "curve-pdas": { account: pdas, owner: [], filters: [] } }
+        : {},
+      slots: {},
+      transactions: {
+        launchpads: {
+          vote: false,
+          failed: false,
+          accountInclude: LAUNCHPAD_PROGRAM_IDS,
+          accountExclude: [],
+          accountRequired: [],
+        },
+      },
+      transactionsStatus: {},
+      entry: {},
+      blocks: {},
+      blocksMeta: {},
+      commitment: CommitmentLevel.PROCESSED,
+      accountsDataSlice: [],
+    };
+    try {
+      this.stream.write(req);
+      console.log(`[Yellowstone] Subscription updated: ${LAUNCHPAD_PROGRAM_IDS.length} programs + ${pdas.length} curve PDAs`);
+    } catch (_) {}
+  }
+
+  // On reconnect, restore curve subscriptions from Redis for non-graduated tokens
+  private async restoreCurveSubscriptions() {
+    try {
+      const mints = await redis.zrevrange("tokens:latest", 0, 49); // max 50 — Chainstack account sub limit
+      if (!mints.length) return;
+      const pipeline = redis.pipeline();
+      for (const m of mints) pipeline.hmget(`token:${m}`, "curvePDA", "platform", "complete");
+      const results = await pipeline.exec();
+      for (let i = 0; i < mints.length; i++) {
+        const [pda, platform, complete] = (results?.[i]?.[1] as string[]) || [];
+        if (pda && platform && complete !== "true") {
+          this.curveAccounts.set(pda, { mint: mints[i], platform });
+        }
+      }
+      // Always call sendFullSubscription — includes both launchpad tx filter + restored PDAs
+      this.sendFullSubscription();
+      console.log(`[Yellowstone] Restored ${this.curveAccounts.size} curve subscriptions.`);
+    } catch (e: any) {
+      console.error("[Yellowstone] Failed to restore curve subs:", e.message);
     }
   }
 
@@ -79,30 +174,6 @@ export class YellowstoneManager extends EventEmitter {
     });
   }
 
-  private subscribeToLaunchpads() {
-    const req: any = {
-      accounts: {},
-      slots: {},
-      transactions: {
-        launchpads: {
-          vote: false,
-          failed: false,
-          accountInclude: LAUNCHPAD_PROGRAM_IDS,
-          accountExclude: [],
-          accountRequired: [],
-        },
-      },
-      transactionsStatus: {},
-      entry: {},
-      blocks: {},
-      blocksMeta: {},
-      commitment: CommitmentLevel.PROCESSED,
-      accountsDataSlice: [],
-    };
-    this.stream.write(req);
-    console.log(`[Yellowstone] Subscribed to ${LAUNCHPAD_PROGRAM_IDS.length} launchpad program IDs.`);
-  }
-
   private handleUpdate(u: SubscribeUpdate) {
     if (this.msgCount % 200 === 0) {
       console.log(`[Yellowstone] #${this.msgCount} | txs=${this.txCount}`);
@@ -111,6 +182,27 @@ export class YellowstoneManager extends EventEmitter {
       this.txCount++;
       this.processTx(u.transaction).catch(() => {});
     }
+    if ((u as any).account) {
+      this.processAccountUpdate((u as any).account).catch(() => {});
+    }
+  }
+
+  // ── Geyser account update handler ───────────────────────────────────────────
+  private async processAccountUpdate(wrapper: any) {
+    if (!wrapper?.account?.pubkey) return;
+    const pubkey = bs58.encode(wrapper.account.pubkey);
+    const curveInfo = this.curveAccounts.get(pubkey);
+    if (!curveInfo) return;
+
+    const data = Buffer.from(wrapper.account.data);
+    if (data.length < 8) return; // Too short to be valid curve data
+
+    this.emit("curve-update", {
+      curvePDA: pubkey,
+      mint: curveInfo.mint,
+      platform: curveInfo.platform,
+      data,
+    });
   }
 
   private async processTx(wrapper: any) {
@@ -131,9 +223,6 @@ export class YellowstoneManager extends EventEmitter {
     if (!mint) return;
 
     // ── Meteora DBC label resolution (bags vs meteora) ─────────────────────────
-    // detectParser() returns MeteoraParser (id="meteora") for all Meteora DBC txs.
-    // Symbol isn't known yet at this point — resolveMeteoraId is called again after
-    // parseMetadata() if needed, passing the parsed symbol and logs for fuller detection.
     const platformId = parser.id === "meteora"
       ? resolveMeteoraId(mint)
       : parser.id;
@@ -146,18 +235,11 @@ export class YellowstoneManager extends EventEmitter {
     if (parser.isCreate(logs, message, meta)) {
       const parsed = parser.parseMetadata(logs, message, meta);
 
-      // Strict platforms (Pump.fun) require name+symbol in the tx itself
       if (parser.strictMetadata && (!parsed.name || !parsed.symbol)) return;
 
-      // Store raw parsed values (empty string if absent) — the payload builder applies
-      // display defaults ("Unknown Token" / "???"), and the enricher checks !existing.name
-      // to detect missing metadata. Storing "Unknown Token" would block that patch.
       const name   = parsed.name   || "";
       const symbol = parsed.symbol || "";
-
-      // Re-resolve Meteora label now that we have the parsed symbol
       const finalPlatformId = platformId;
-
       const curvePDA = parser.deriveCurvePDA(mint);
       const slot     = wrapper.slot?.toString() || "0";
 
@@ -179,12 +261,35 @@ export class YellowstoneManager extends EventEmitter {
 
       // Emit first — index.ts handler starts immediately without waiting for Redis
       this.emit("new-launch", { ...tokenData, signature });
-      // Persist in background (both writes in parallel, non-blocking)
+      // Persist core token data + increment creator launch counter in parallel
       Promise.all([
         redis.hset(`token:${mint}`, tokenData),
         redis.zadd("tokens:latest", Date.now(), mint),
+        redis.hincrby(`creator:${maker}`, "launched", 1),
       ]).catch(() => {});
       return; // A create tx is never also a swap
+    }
+
+    // ── Migration / graduation detection ──────────────────────────────────────
+    // Belt-and-suspenders: Geyser curve account updates already detect completion via
+    // the complete flag, but migration transactions may emit distinct signals before
+    // (or instead of) an account update arriving. Marking complete here ensures the
+    // graduation is reflected even if the curve account is zeroed/deleted on migration.
+    if (this.isMigrationTx(logs, parser.id)) {
+      const exists = await redis.exists(`token:${mint}`);
+      if (exists) {
+        const tokenData = await redis.hgetall(`token:${mint}`);
+        if (tokenData && tokenData.complete !== "true") {
+          await redis.hset(`token:${mint}`, { complete: "true", graduationStatus: "graduated" });
+          if (tokenData.creator) {
+            redis.hincrby(`creator:${tokenData.creator}`, "migrated", 1).catch(() => {});
+          }
+          if (tokenData.curvePDA) this.removeCurvePDA(tokenData.curvePDA);
+          await redis.publish("token-updates", mint);
+          console.log(`[Yellowstone] 🎓 GRADUATED (${parser.id}): ${mint.slice(0, 12)}`);
+        }
+      }
+      return; // migration is not also a swap
     }
 
     // ── Swap detection ─────────────────────────────────────────────────────────
@@ -211,6 +316,29 @@ export class YellowstoneManager extends EventEmitter {
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  // ── Migration signal detection ───────────────────────────────────────────────
+  // Returns true if the transaction looks like a bonding-curve → DEX migration.
+  // Uses platform-specific log signals to minimize false positives.
+  // Pump.fun:   "Instruction: Migrate" within the pump program context
+  // LaunchLab:  "migrate" or "MigrateToAmm" in LaunchLab program logs
+  // Moon.it:    graduation happens via curve fill, not a separate migrate tx
+  // Meteora:    graduation happens via curve fill, not a separate migrate tx
+  private isMigrationTx(logs: string[], platformId: string): boolean {
+    if (platformId === "pump") {
+      return logs.some(l => l.includes("Instruction: Migrate"));
+    }
+    if (platformId === "launchlab" || platformId === "letsbonk") {
+      return logs.some(l =>
+        l.includes("MigrateToAmm") ||
+        l.includes("migrate_to_amm") ||
+        l.includes("Instruction: MigrateFunds") ||
+        l.includes("Instruction: Migrate"),
+      );
+    }
+    // Moon/Bags/Meteora: graduation is detected via curvePercentage in account updates
+    return false;
+  }
 
   private extractMint(meta: any): string {
     for (const b of (meta?.postTokenBalances || [])) {

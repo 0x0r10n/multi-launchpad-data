@@ -10,9 +10,15 @@ const umi = createUmi(process.env.SOLANA_RPC!);
 
 const IPFS_GATEWAYS = [
   "https://cf-ipfs.com/ipfs/",
+  "https://cloudflare-ipfs.com/ipfs/",
   "https://ipfs.io/ipfs/",
   "https://gateway.pinata.cloud/ipfs/",
+  "https://nftstorage.link/ipfs/",
+  "https://ipfs.filebase.io/ipfs/",
 ];
+
+// Arweave gateway for ar:// URIs (common for Pump.fun tokens)
+const ARWEAVE_GATEWAY = "https://arweave.net/";
 
 export function queueEnrichment(mint: string) {
   enrichToken(mint).catch(e => console.error(`[Enricher] Failed ${mint.slice(0, 8)}: ${e.message}`));
@@ -92,7 +98,7 @@ export function startEnrichmentSweep() {
       let retried = 0;
       for (const mint of mints) {
         const [image, name, symbol] = await redis.hmget(`token:${mint}`, "image", "name", "symbol");
-        if (!image || image === "" || name === "Unknown Token" || symbol === "???") {
+        if (!image || image === "" || !name || name === "" || name === "Unknown Token" || !symbol || symbol === "" || symbol === "???") {
           enrichToken(mint).catch(() => {});
           retried++;
         }
@@ -105,26 +111,26 @@ export function startEnrichmentSweep() {
 }
 
 async function fetchOffChainMetadata(uri: string): Promise<any | null> {
-  const url = resolveIpfsUrl(uri);
-
-  // Try the resolved primary URL first
+  // Check Redis cache first — 24h TTL so re-launches or refreshes are instant
+  const cacheKey = `meta-cache:${uri.slice(0, 200)}`;
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 4000);
-    const res = await fetch(url, { signal: ctrl.signal, headers: { "Accept": "application/json" } });
-    clearTimeout(t);
-    if (res.ok) return await res.json();
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
   } catch {}
 
-  // IPFS fallback: race all gateways in parallel — take the first to respond successfully.
-  // Sequential retries are the old bottleneck (3× 5s timeouts = up to 15s). Parallel = one wait.
-  if (uri.includes("ipfs")) {
+  let metadata: any | null = null;
+
+  const isIpfs = uri.startsWith("ipfs://") || uri.includes("/ipfs/");
+
+  if (isIpfs) {
+    // Race all IPFS gateways in parallel — no sequential primary attempt.
+    // Promise.any takes the first success; gateways that fail are ignored.
     const hash = extractIpfsHash(uri);
     if (hash) {
-      return await Promise.any(
+      metadata = await Promise.any(
         IPFS_GATEWAYS.map(async gw => {
           const ctrl = new AbortController();
-          const t = setTimeout(() => ctrl.abort(), 5000);
+          const t = setTimeout(() => ctrl.abort(), 4000);
           try {
             const res = await fetch(gw + hash, { signal: ctrl.signal, headers: { "Accept": "application/json" } });
             clearTimeout(t);
@@ -137,13 +143,27 @@ async function fetchOffChainMetadata(uri: string): Promise<any | null> {
         }),
       ).catch(() => null);
     }
+  } else {
+    // Direct URL (HTTPS, Arweave via resolveIpfsUrl, pump.fun servers, etc.)
+    const url = resolveIpfsUrl(uri);
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 3000);
+      const res = await fetch(url, { signal: ctrl.signal, headers: { "Accept": "application/json" } });
+      clearTimeout(t);
+      if (res.ok) metadata = await res.json();
+    } catch {}
   }
 
-  return null;
+  if (metadata) {
+    redis.setex(cacheKey, 86400, JSON.stringify(metadata)).catch(() => {});
+  }
+  return metadata;
 }
 
 function resolveIpfsUrl(uri: string): string {
   if (uri.startsWith("ipfs://")) return "https://cf-ipfs.com/ipfs/" + uri.slice(7);
+  if (uri.startsWith("ar://"))   return ARWEAVE_GATEWAY + uri.slice(5);
   return uri;
 }
 
