@@ -1,8 +1,8 @@
-import redis from './redis';
+import Redis from 'ioredis';
 import { Connection, PublicKey } from '@solana/web3.js';
-import dotenv from 'dotenv';
+import 'dotenv/config';
 
-dotenv.config();
+const redis = new Redis(process.env.REDIS_URL!);
 
 const RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
 const connection = new Connection(RPC, 'confirmed');

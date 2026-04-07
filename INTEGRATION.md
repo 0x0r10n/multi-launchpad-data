@@ -10,6 +10,12 @@
 2. [Connection Details](#2-connection-details)
 3. [Available WebSocket Rooms](#3-available-websocket-rooms)
 4. [Message Format](#4-message-format)
+   - 4.1 Envelope
+   - 4.2 Full Token Payload
+   - 4.3 Two-Phase Broadcast for New Tokens
+   - 4.4 Timestamp Notes
+   - 4.5 Trending Payload
+   - 4.6 Chart Tick Payload
 5. [Integration Examples](#5-integration-examples)
 6. [Best Practices](#6-best-practices)
 7. [Current Limitations](#7-current-limitations)
@@ -25,7 +31,8 @@ All token payloads follow a **unified schema** — regardless of which launchpad
 **Key advantages:**
 
 - Live data from block production via Yellowstone gRPC at `PROCESSED` commitment
-- 100% on-chain metadata resolution via Metaplex PDA — no third-party token APIs
+- Two-phase broadcast: skeleton payload (~5ms after launch) then rich payload (~100–500ms) with price, top10, and dev stats
+- `meta` completeness flags on every payload — frontend can show progressive loading states without guessing
 - Snapshot-on-join: every room sends its current state immediately when a client subscribes
 - Unified schema across all supported launchpads
 - SOL price via Jupiter; no other external price oracles
@@ -41,7 +48,7 @@ All token payloads follow a **unified schema** — regardless of which launchpad
 | LetsBonk | `letsbonk` | `FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1` |
 | Raydium LaunchLab | `launchlab` | `LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj` |
 
-> Bags.fm and Meteora DBC share the same on-chain program. The indexer distinguishes them by inspecting the token mint suffix (`BAGS` → `bags`, otherwise `meteora`).
+> Bags.fm and Meteora DBC share the same on-chain program. The indexer distinguishes them at runtime by inspecting the token's pool configuration.
 
 ---
 
@@ -128,7 +135,7 @@ Every event except `trade` is wrapped in an envelope:
 ```
 
 For `message`, `update`, and `snapshot` events, `data` is a **Full Token Payload** (see below).
-For `trending` see [Trending Payload](#44-trending-payload). For `chart` see [Chart Tick Payload](#45-chart-tick-payload).
+For `trending` see [Trending Payload](#45-trending-payload). For `chart` see [Chart Tick Payload](#46-chart-tick-payload).
 
 ---
 
@@ -254,7 +261,20 @@ For `trending` see [Trending Payload](#44-trending-payload). For `chart` see [Ch
   // Recent price ticks (last 50); full history via chart:{mint} or REST
   "priceHistory": [
     { "time": 1711699200123, "price": 0.00000052, "price_usd": 0.0000728 }
-  ]
+  ],
+
+  // Completeness flags — use these to drive progressive loading states.
+  // A new token emits two broadcasts: a skeleton (~5ms) and a rich update (~100–500ms).
+  // Rather than hard-coding timers, read these flags to know what data has arrived.
+  "meta": {
+    "hasPrice":        true,   // price + liquidity populated (arrives with rich broadcast)
+    "hasBasicRisk":    true,   // dev launch history + sniper count (same broadcast as price)
+    "hasTop10":        true,   // top10 concentration + dev% computed (inline or t=2s fallback)
+    "hasRisk":         true,   // full quick scan complete (superset of hasTop10)
+    "hasImage":        false,  // IPFS/Arweave image resolved (async, may lag a few seconds)
+    "expectedRichBy":  1711699200450, // ms timestamp by which hasPrice should be true
+    "richPayloadDelay": 183    // actual ms from launch to rich broadcast (null if not yet sent)
+  }
 }
 ```
 
@@ -284,14 +304,56 @@ For `trending` see [Trending Payload](#44-trending-payload). For `chart` see [Ch
 
 ---
 
-### 4.3 Timestamp Notes
+### 4.3 Two-Phase Broadcast for New Tokens
+
+Every new token triggers **two sequential broadcasts** to the `new` room and `token:{mint}` room:
+
+| Phase | Timing | What's populated |
+|---|---|---|
+| **Skeleton** | ~5ms after on-chain detection | `token.*`, `pools[0].market`, `pools[0].deployer`, `meta.hasPrice: false` |
+| **Rich** | ~100–500ms after detection | Everything above + price, liquidity, marketCap, curvePercentage, top10, devPercentage, devStats, snipersCount |
+
+After the rich broadcast, further updates continue to arrive as:
+- **Geyser curve pushes** — price/liquidity/curvePercentage update on every trade (~real-time)
+- **t=15s full risk** — snipers/insiders arrays with resolved wallet owners
+- **Async enrichment** — image, description, socials (seconds to minutes depending on IPFS)
+
+**Use `meta` flags rather than timers:**
+
+```ts
+socket.on("message", (envelope) => {
+  if (envelope.room === "new") {
+    const { data, meta } = envelope.data;
+
+    if (!meta.hasPrice) {
+      showSkeletonCard(data);          // First broadcast — no price yet
+    } else {
+      showRichCard(data);              // Price + curve + risk included
+    }
+
+    if (!meta.hasImage) {
+      showImagePlaceholder();          // IPFS not resolved yet
+    }
+
+    if (!meta.hasTop10) {
+      showRiskSkeleton();              // Holder scan still pending
+    }
+  }
+});
+```
+
+If `Date.now() > meta.expectedRichBy` and `meta.hasPrice` is still false, the rich broadcast was delayed (rare). Show a "data delayed" indicator rather than a permanent skeleton.
+
+---
+
+### 4.4 Timestamp Notes
 
 > `token.creation.created_time` is in **Unix seconds**.
 > All other timestamps (`pools[0].createdAt`, `pools[0].lastUpdated`, `priceHistory[].time`) are in **milliseconds**.
 
 ---
 
-### 4.4 Trending Payload
+### 4.5 Trending Payload
 
 ```jsonc
 {
@@ -310,7 +372,7 @@ Rankings are recalculated every 30 seconds.
 
 ---
 
-### 4.5 Chart Tick Payload
+### 4.6 Chart Tick Payload
 
 **On join** — snapshot with full history (up to 500 ticks):
 
@@ -580,15 +642,20 @@ socket.on("chart", (envelope) => {
 });
 ```
 
-**Risk data note:** Risk fields (`snipers`, `insiders`, `top10`, `dev`) may be empty for up to 60 seconds after the token launches. Render a loading state and update it when the first `message` event arrives with a populated `risk` object.
+**Risk data note:** Use `meta.hasTop10` and `meta.hasRisk` to drive loading states rather than inspecting field values. `top10` and `devPercentage` typically arrive in the rich broadcast (~100–500ms). Full snipers/insiders analysis arrives at ~15s.
 
 ```ts
-function renderRiskPanel(risk: Risk) {
-  if (!risk || risk.snipers.count === 0 && risk.insiders.count === 0 && risk.top10 === 0) {
-    showRiskSkeleton();
+function renderRiskPanel(risk: any, meta: any) {
+  if (!meta.hasTop10) {
+    showRiskSkeleton();   // Holder scan still pending
     return;
   }
-  showRiskData(risk);
+  if (!meta.hasRisk) {
+    // top10 + dev% available but full sniper/insider resolution still pending
+    showPartialRisk(risk);
+    return;
+  }
+  showFullRisk(risk);
 }
 ```
 
@@ -828,9 +895,17 @@ When a user navigates away from a token detail page, leave the corresponding `to
 
 `pools[0].txns.volume` is **all-time** volume. Use `pools[0].txns.volume24h` for 24h figures. For trending volume use the pre-sorted `trending` room arrays.
 
-### Expect metadata and risk data to arrive after launch
+### Use `meta` flags for progressive loading
 
-Images, descriptions, and socials are resolved asynchronously after token creation. Risk analysis has a minimum 60-second cooldown per token. Listen for `update` events and design your UI to handle temporarily empty fields gracefully.
+Every payload carries a `meta` object with boolean completeness flags. Use these instead of hard-coded timers or field-value checks:
+
+- `meta.hasPrice` — price/liquidity/curvePercentage are populated
+- `meta.hasBasicRisk` — dev launch history and sniper count are populated
+- `meta.hasTop10` — top10 concentration and dev% are populated
+- `meta.hasRisk` — full quick scan is done (superset of `hasTop10`)
+- `meta.hasImage` — IPFS/Arweave image has resolved
+
+`top10` and `devPercentage` typically arrive in the **same broadcast as price** (~100–500ms). Full sniper/insider resolution arrives at ~15s. IPFS metadata may take several seconds and occasionally longer depending on gateway latency.
 
 ---
 
@@ -839,8 +914,10 @@ Images, descriptions, and socials are resolved asynchronously after token creati
 | Area | Current State |
 |---|---|
 | **Commitment level** | `PROCESSED` — data arrives as fast as possible but rare chain forks may cause transient incorrect values |
-| **Risk analysis latency** | Minimum 60-second cooldown per token; fresh tokens will show empty risk fields for up to a minute |
+| **First payload latency** | Skeleton ~5ms, rich payload (price + top10 + dev stats) ~100–500ms after on-chain detection |
+| **Risk analysis latency** | `top10` + `devPercentage` typically inline with rich broadcast; full sniper/insider analysis at ~15s |
 | **Metadata availability** | `image`, `description`, and socials are fetched asynchronously — may lag a few seconds behind the launch event |
+| **Geyser account limit** | 50 curve PDAs tracked simultaneously (Chainstack plan limit); oldest PDA is evicted when capacity is reached |
 | **Chart depth** | Maximum 500 price ticks stored per token; no long-term OHLCV candle aggregation |
 | **24h volume accuracy** | Only counts trades observed since the indexer indexed the token; may undercount on older tokens |
 | **Multi-pool support** | `pools` always contains one entry; post-graduation AMM pools are not yet tracked |

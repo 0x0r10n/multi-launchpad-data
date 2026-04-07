@@ -3,9 +3,9 @@ import express from "express";
 import { Server } from "socket.io";
 import { YellowstoneManager } from "./yellowstone-manager";
 import { queueEnrichment, startEnrichmentSweep } from "./enricher";
-import { queueCurveUpdate, startCurveRefreshLoop, fetchAndDecodeCurve } from "./curve-tracker";
-import { startPriceTracker, getPriceHistory, recordPrice, calcPriceEvents } from "./price-tracker";
-import { queueRiskAnalysis, startRiskAnalysisLoop } from "./risk-analyzer";
+import { processCurveAccountUpdate, fetchAndDecodeCurve } from "./curve-tracker";
+import { startPriceTracker, getPriceHistory, recordPrice } from "./price-tracker";
+import { queueRiskAnalysis, queueInitialQuickRisk, startHolderSnapshot } from "./risk-analyzer";
 import Redis from "ioredis";
 import "dotenv/config";
 import cors from "cors";
@@ -21,12 +21,38 @@ const redis = new Redis(process.env.REDIS_URL!);
 const subscriber = new Redis(process.env.REDIS_URL!);
 const yellowstone = new YellowstoneManager();
 
+// Pending first-curve resolvers: mint → resolve fn.
+// Registered synchronously on new-launch so Geyser delivery is never missed.
+const pendingFirstCurve = new Map<string, (fields: Record<string, string> | null) => void>();
+
+// In-memory buffer for rich payload latency telemetry (ms from launch to rich broadcast).
+// Flushed every 5 minutes with p50/p95/p99 — no per-token Redis overhead.
+const richDelayBuffer: number[] = [];
+// Tracks how many rich broadcasts included top10 via the inline holder path.
+let top10InlineCount = 0;
+
+// Race two curve-data promises — first non-null result wins.
+// If both resolve null, returns null (skeleton stays until Geyser pushes later).
+function raceCurveData(
+  a: Promise<Record<string, string> | null>,
+  b: Promise<Record<string, string> | null>,
+): Promise<Record<string, string> | null> {
+  return new Promise(resolve => {
+    let resolved: Record<string, string> | null = null;
+    let remaining = 2;
+    function onResult(v: Record<string, string> | null) {
+      remaining--;
+      if (v !== null && resolved === null) { resolved = v; resolve(v); }
+      else if (remaining === 0 && resolved === null) resolve(null);
+    }
+    a.then(onResult).catch(() => onResult(null));
+    b.then(onResult).catch(() => onResult(null));
+  });
+}
+
 yellowstone.start().catch((err) => console.error("Yellowstone start failed:", err));
 
-// Start periodic curve refresh for active tokens
-startCurveRefreshLoop();
 startPriceTracker();
-startRiskAnalysisLoop();
 startEnrichmentSweep();
 
 // ========== WEBSOCKET ROOMS ==========
@@ -121,29 +147,129 @@ async function broadcastChartTick(mint: string) {
 
 // ========== EVENT HANDLERS ==========
 
-yellowstone.on("new-launch", async (data: any) => {
-  // Fetch bonding curve inline — price/liquidity/curvePercentage in the first broadcast.
-  // Falls back gracefully (fields stay 0) if the account isn't readable yet.
-  if (data.curvePDA) {
-    const curveFields = await fetchAndDecodeCurve(data.mint, data.curvePDA, data.platform || "pump");
-    if (curveFields) {
-      Object.assign(data, curveFields);
-      // Persist curve fields async — don't block the broadcast
-      redis.hset(`token:${data.mint}`, curveFields).catch(() => {});
-    }
+// ── Geyser curve account update handler ─────────────────────────────────────
+yellowstone.on("curve-update", async (event: any) => {
+  const fields = await processCurveAccountUpdate(event.mint, event.data, event.platform);
+
+  // Resolve pending first-curve race if the new-launch handler is still waiting
+  const resolver = pendingFirstCurve.get(event.mint);
+  if (resolver && fields) {
+    pendingFirstCurve.delete(event.mint);
+    resolver(fields);
   }
 
-  // New tokens have no price history — pass [] directly to skip the Redis lrange call
-  const payload = await buildTokenPayload(data, false, []);
-  broadcastNewToken(payload);
-  broadcastTokenUpdate(data.mint, payload);
+  if (fields?.complete === "true" && event.curvePDA) {
+    yellowstone.removeCurvePDA(event.curvePDA);
+  }
+});
 
-  console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | price=${parseFloat(data.priceUsd || "0").toFixed(8)} | ${data.mint.slice(0, 12)}...`);
+yellowstone.on("new-launch", async (data: any) => {
+  const platform = data.platform || "pump";
 
-  // Background: image/socials (IPFS — slow, non-blocking) and risk (RPC-heavy)
+  // ── t=0 SYNC: Register Geyser listener before any await ─────────────────────
+  // Must be synchronous so we never miss a Geyser snapshot that arrives
+  // while we're awaiting the skeleton build or curve race below.
+  const geyserFirstCurve: Promise<Record<string, string> | null> = data.curvePDA
+    ? new Promise(resolve => {
+        pendingFirstCurve.set(data.mint, resolve);
+        setTimeout(() => { if (pendingFirstCurve.delete(data.mint)) resolve(null); }, 800);
+      })
+    : Promise.resolve(null);
+
+  // ── t=0 ASYNC: Fire all parallel work immediately ────────────────────────────
+  // These three tasks start before the skeleton broadcast. By the time the curve
+  // race resolves (~100-400ms), the Redis reads are always done (~1ms each) and
+  // the holder fetch is often done too (~150-400ms RPC).
+  if (data.curvePDA) yellowstone.addCurvePDA(data.curvePDA, data.mint, platform);
+
+  const rpcProbe = data.curvePDA
+    ? fetchAndDecodeCurve(data.mint, data.curvePDA, platform, 100)
+    : Promise.resolve(null);
+
+  // Holder snapshot: getTokenLargestAccounts (500ms internal timeout)
+  // Used for top10 concentration + ATA-derived dev% in the second broadcast.
+  let holderFields: { top10: string; devPercentage: string } | null = null;
+  const holderPromise = data.curvePDA
+    ? startHolderSnapshot(data.mint, data.creator || "", data.curvePDA, platform)
+        .then(f => { holderFields = f; return f; })
+    : Promise.resolve(null);
+
+  // Redis reads start immediately — both done in ~1ms, well before curve race resolves
+  const sniperPromise  = redis.smembers(`snipers_set:${data.mint}`);
+  const creatorPromise = data.creator
+    ? redis.hgetall(`creator:${data.creator}`)
+    : Promise.resolve({} as Record<string, string>);
+
+  // ── Skeleton broadcast (t≈5ms — after one Redis get for payload cache) ───────
+  const skeletonPayload = await buildTokenPayload(data, false, []);
+  broadcastNewToken(skeletonPayload);
+  broadcastTokenUpdate(data.mint, skeletonPayload);
+  console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | ${data.mint.slice(0, 12)}...`);
+
+  // ── Curve race: RPC probe (100ms) vs Geyser first snapshot (800ms safety) ────
+  if (data.curvePDA) {
+    const curveFields = await raceCurveData(rpcProbe, geyserFirstCurve);
+    pendingFirstCurve.delete(data.mint);
+
+    if (curveFields) {
+      Object.assign(data, curveFields);
+
+      // Redis reads are long done by now (~1ms each, started at t=0)
+      const [earlyBuyers, creatorHash] = await Promise.all([sniperPromise, creatorPromise]);
+
+      // Give holder snapshot up to 450ms extra after curve resolves.
+      // holderPromise started at t=0, so total budget = curve_race_time + 450ms.
+      // Internal timeout (480ms) is the binding constraint in all cases.
+      if (!holderFields) {
+        holderFields = await Promise.race([
+          holderPromise,
+          new Promise<null>(r => setTimeout(() => r(null), 450)),
+        ]);
+      }
+
+      // Build one combined rich update: price + curve + dev context + top10 (if ready)
+      const richPayloadMs = Date.now() - parseInt(data.createdAt || "0");
+      richDelayBuffer.push(richPayloadMs);
+      if (holderFields) top10InlineCount++;
+      const richFields: Record<string, string> = {
+        snipersCount:  earlyBuyers.length.toString(),
+        devStats:      JSON.stringify({
+          total_launched: parseInt(creatorHash.launched || "0"),
+          total_migrated: parseInt(creatorHash.migrated || "0"),
+        }),
+        richPayloadMs: richPayloadMs.toString(), // telemetry: ms from launch to rich broadcast
+        ...(holderFields
+          ? {
+              top10:           holderFields.top10,
+              devPercentage:   holderFields.devPercentage,
+              riskQuickScanAt: Date.now().toString(), // marks quick scan done → t=2s skips
+            }
+          : {}),
+      };
+      Object.assign(data, richFields);
+
+      redis.hset(`token:${data.mint}`, { ...curveFields, ...richFields }).catch(() => {});
+      const richPayload = await buildTokenPayload(data, true, []);
+      broadcastNewToken(richPayload);
+      broadcastTokenUpdate(data.mint, richPayload);
+      console.log(
+        `[BROADCAST] 💰 ${data.name} | price=${parseFloat(data.priceUsd || "0").toFixed(8)}` +
+        ` | top10=${holderFields ? holderFields.top10 + "%" : "pending"}` +
+        ` | dev_launches=${creatorHash.launched || "0"} snipers=${earlyBuyers.length}`,
+      );
+    }
+    // No curve data: Geyser will deliver eventually via the pubsub → broadcast path
+  }
+
+  // ── Background enrichment (IPFS/Arweave — non-blocking) ─────────────────────
   queueEnrichment(data.mint);
-  queueRiskAnalysis(data.mint);
-  // Note: curve already fetched inline above. Trade events drive future curve updates.
+
+  // ── t=2s fallback: only runs if riskQuickScanAt not yet set ──────────────────
+  // Covers: holderPromise timed out, or curveFields never arrived above.
+  setTimeout(() => queueInitialQuickRisk(data.mint), 2_000);
+
+  // ── t=15s: full risk — owner resolution, insider detection ───────────────────
+  setTimeout(() => queueRiskAnalysis(data.mint), 15_000);
 });
 
 yellowstone.on("trade", async (data: any) => {
@@ -154,9 +280,8 @@ yellowstone.on("trade", async (data: any) => {
     type: data.type, solAmount: data.solAmount
   });
   
-  // Refresh curve data, record price tick, and recalc events on every trade
-  // These will trigger a PUBSUB message which then broadcasts the full payload update
-  queueCurveUpdate(data.mint);
+  // Curve data is pushed by Geyser when the curve account changes — no RPC call needed.
+  // Just record the price tick (reads cached priceQuote from Redis, no RPC).
   recordPrice(data.mint);
   broadcastChartTick(data.mint);
 
@@ -232,6 +357,20 @@ async function getTokensByStatus(status: string): Promise<any[]> {
   );
   return payloads;
 }
+
+// ========== RICH PAYLOAD LATENCY TELEMETRY ==========
+// Logs p50/p95/p99 of the time from launch detection to rich broadcast.
+// Buffer is in-memory and flushed every 5 minutes — zero per-token overhead.
+setInterval(() => {
+  const n = richDelayBuffer.length;
+  if (n === 0) return;
+  const sorted = [...richDelayBuffer].sort((a, b) => a - b);
+  const p = (pct: number) => sorted[Math.min(Math.floor(n * pct), n - 1)];
+  const top10Pct = ((top10InlineCount / n) * 100).toFixed(1);
+  console.log(`[Telemetry] richPayloadDelay | n=${n} p50=${p(0.50)}ms p95=${p(0.95)}ms p99=${p(0.99)}ms | top10Inline=${top10Pct}%`);
+  richDelayBuffer.length = 0;
+  top10InlineCount = 0;
+}, 5 * 60_000);
 
 // ========== TRENDING JOB ==========
 // Runs every 30s — 1m window needs more frequent refreshes than 60s
@@ -382,6 +521,525 @@ app.get("/api/stats", async (_req, res) => {
   });
 });
 
+// GET /doc — full integration reference in JSON
+app.get("/doc", (_req, res) => {
+  res.json({
+    overview: {
+      description: "Real-time multi-launchpad Solana token indexer. Streams live token launches, trades, price updates, risk analysis, and trending data via Socket.io WebSocket.",
+      websocket_url: "ws://localhost:3000",
+      rest_base_url: "http://localhost:3000",
+      client_library: "socket.io-client (v4)",
+      supported_platforms: ["pump", "moon", "bags", "meteora", "letsbonk", "launchlab"],
+    },
+
+    connection: {
+      install: "npm install socket.io-client",
+      example: `
+import { io } from "socket.io-client";
+
+const socket = io("ws://localhost:3000", {
+  transports: ["websocket"],
+  reconnection: true,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 10000,
+  reconnectionAttempts: Infinity,
+});
+
+socket.on("connect", () => {
+  // re-join all rooms here so they restore after reconnect
+});
+
+socket.on("disconnect", (reason) => {
+  console.warn("disconnected:", reason);
+});`.trim(),
+    },
+
+    payload_shape: {
+      note: "Every token payload — regardless of room or event — has this shape. Access via .data on message/update events, or .data on each array item in snapshots.",
+      fields: {
+        "data.token": {
+          name: "string — token name",
+          symbol: "string — ticker",
+          mint: "string — base58 mint address",
+          uri: "string — off-chain metadata URI",
+          decimals: "number — always 6",
+          description: "string — from metadata (empty until enriched)",
+          image: "string — resolved image URL (empty until IPFS resolves)",
+          hasFileMetaData: "boolean — true if URI exists",
+          createdOn: "string — launchpad URL",
+          strictSocials: { twitter: "string", telegram: "string", website: "string" },
+          creation: { creator: "string — wallet", created_tx: "string — signature", created_time: "number — unix seconds" },
+        },
+        "data.pools[0]": {
+          poolId: "string — bonding curve PDA",
+          liquidity: { quote: "number — SOL", usd: "number — USD" },
+          price: { quote: "number — price in SOL", usd: "number — price in USD" },
+          marketCap: { quote: "number — SOL", usd: "number — USD" },
+          curvePercentage: "number — 0-100, how full the bonding curve is",
+          txns: { buys: "number", sells: "number", total: "number", volume: "number — all-time SOL", volume24h: "number — 24h SOL" },
+          market: "string — platform ID (pumpfun / moon / bags / meteora / letsbonk / launchlab)",
+          deployer: "string — creator wallet",
+          createdAt: "number — ms timestamp",
+          lastUpdated: "number — ms timestamp",
+        },
+        "data.events": {
+          "1m":  { priceChangePercentage: "number" },
+          "5m":  { priceChangePercentage: "number" },
+          "15m": { priceChangePercentage: "number" },
+          "30m": { priceChangePercentage: "number" },
+          "1h":  { priceChangePercentage: "number" },
+          "4h":  { priceChangePercentage: "number" },
+          "24h": { priceChangePercentage: "number" },
+        },
+        "data.risk": {
+          top10: "number — % of supply held by top 10 wallets",
+          snipers: { count: "number", totalPercentage: "number", totalBalance: "number", wallets: "array — { wallet, percentage, amount, isTimeBasedSniper }" },
+          insiders: { count: "number", totalPercentage: "number", totalBalance: "number", wallets: "array — { wallet, percentage, amount }" },
+          dev: { percentage: "number", amount: "number", stats: { total_launched: "number", total_migrated: "number" } },
+        },
+        "data.graduation": {
+          status: "string — 'new' | 'graduating' | 'graduated'",
+        },
+        "data.dev_stats": {
+          total_launched: "number — total tokens this wallet has launched",
+          total_migrated: "number — total tokens this wallet has graduated",
+        },
+        "data.priceHistory": "array — [{ time: ms, price: SOL, price_usd: USD }] — last 50 ticks (up to 500 via chart room or REST)",
+        "data.meta": {
+          hasPrice: "boolean — price/liquidity populated (arrives ~100-500ms after launch)",
+          hasBasicRisk: "boolean — dev stats + sniper count populated",
+          hasTop10: "boolean — top10 concentration + dev% populated",
+          hasRisk: "boolean — full risk scan complete",
+          hasImage: "boolean — IPFS/Arweave image resolved",
+          expectedRichBy: "number — ms timestamp by which hasPrice should be true",
+          richPayloadDelay: "number | null — actual ms from launch to rich broadcast",
+        },
+      },
+    },
+
+    rooms: {
+      new: {
+        description: "Every new token launch across all platforms. Auto-joined on connect — no need to emit join.",
+        auto_joined: true,
+        events: {
+          snapshot: {
+            trigger: "Fires once immediately on connect",
+            data_shape: "array of token envelopes",
+            access_pattern: "envelope.data[i].data.token / envelope.data[i].data.pools[0]",
+            example: `
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === "new") {
+    envelope.data.forEach((item) => {
+      const token = item.data.token;
+      const pool  = item.data.pools[0];
+      const meta  = item.data.meta;
+      console.log(token.name, pool.price.usd, pool.marketCap.usd);
+    });
+  }
+});`.trim(),
+          },
+          message: {
+            trigger: "Fires for every new token detected after connect. Two messages per token: skeleton (~5ms, meta.hasPrice=false) then rich (~100-500ms, meta.hasPrice=true)",
+            data_shape: "single token envelope",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+            example: `
+socket.on("message", (envelope) => {
+  if (envelope.room === "new") {
+    const token = envelope.data.token;
+    const pool  = envelope.data.pools[0];
+    const meta  = envelope.data.meta;
+
+    if (!meta.hasPrice) {
+      // First broadcast — skeleton only, price not yet available
+      renderSkeletonCard(token);
+    } else {
+      // Rich broadcast — price, top10, dev stats all included
+      renderFullCard(token, pool, envelope.data.risk);
+    }
+  }
+});`.trim(),
+          },
+          update: {
+            trigger: "Fires when an existing token updates (price change, risk analysis, metadata resolved)",
+            data_shape: "single token envelope",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+            example: `
+socket.on("update", (envelope) => {
+  if (envelope.room === "new") {
+    const mint = envelope.data.token.mint;
+    upsertTokenCard(mint, envelope.data);
+  }
+});`.trim(),
+          },
+        },
+        full_example: `
+import { io } from "socket.io-client";
+
+const socket = io("ws://localhost:3000", { transports: ["websocket"] });
+const tokens = new Map();
+
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === "new") {
+    envelope.data.forEach((item) => {
+      tokens.set(item.data.token.mint, item.data);
+    });
+    renderList([...tokens.values()]);
+  }
+});
+
+socket.on("message", (envelope) => {
+  if (envelope.room === "new") {
+    tokens.set(envelope.data.token.mint, envelope.data);
+    renderList([...tokens.values()]);
+  }
+});
+
+socket.on("update", (envelope) => {
+  if (envelope.room === "new") {
+    tokens.set(envelope.data.token.mint, envelope.data);
+    renderList([...tokens.values()]);
+  }
+});`.trim(),
+      },
+
+      graduating: {
+        description: "Tokens whose bonding curve is >= 80% filled. Snapshot on join, message when a token enters.",
+        auto_joined: false,
+        join: `socket.emit("join", "graduating")`,
+        events: {
+          snapshot: {
+            trigger: "Fires once on join with all currently graduating tokens",
+            data_shape: "array of token envelopes",
+            access_pattern: "envelope.data[i].data.token / envelope.data[i].data.pools[0]",
+          },
+          message: {
+            trigger: "Fires when a token's curvePercentage crosses 80%",
+            data_shape: "single token envelope",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+          },
+          update: {
+            trigger: "Fires when a graduating token's price or curve% updates",
+            data_shape: "single token envelope",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+          },
+        },
+        example: `
+socket.emit("join", "graduating");
+
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === "graduating") {
+    envelope.data.forEach((item) => {
+      const token = item.data.token;
+      const pool  = item.data.pools[0];
+      // pool.curvePercentage >= 80 here
+      addToGraduatingList(token, pool);
+    });
+  }
+});
+
+socket.on("message", (envelope) => {
+  if (envelope.room === "graduating") {
+    const token = envelope.data.token;
+    const pool  = envelope.data.pools[0];
+    addToGraduatingList(token, pool);
+  }
+});`.trim(),
+      },
+
+      graduated: {
+        description: "Tokens whose bonding curve has completed and migrated to a DEX. Snapshot on join, message when graduation is detected.",
+        auto_joined: false,
+        join: `socket.emit("join", "graduated")`,
+        events: {
+          snapshot: {
+            trigger: "Fires once on join with all graduated tokens the indexer has seen",
+            data_shape: "array of token envelopes",
+            access_pattern: "envelope.data[i].data.token / envelope.data[i].data.pools[0]",
+          },
+          message: {
+            trigger: "Fires the moment a token's on-chain complete flag is detected",
+            data_shape: "single token envelope",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+          },
+        },
+        example: `
+socket.emit("join", "graduated");
+
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === "graduated") {
+    envelope.data.forEach((item) => {
+      const token = item.data.token;
+      const pool  = item.data.pools[0];
+      // pool.curvePercentage ~100, graduation.status === "graduated"
+      addToGraduatedFeed(token, pool);
+    });
+  }
+});
+
+socket.on("message", (envelope) => {
+  if (envelope.room === "graduated") {
+    const token = envelope.data.token;
+    const pool  = envelope.data.pools[0];
+    prependToGraduatedFeed(token, pool);
+  }
+});`.trim(),
+      },
+
+      trending: {
+        description: "Top 50 tokens by volume for four time windows: 1m, 5m, 30m, 1h. Full list refreshed every 30 seconds. Switching windows is a local state change — no re-subscribe needed.",
+        auto_joined: false,
+        join: `socket.emit("join", "trending")`,
+        windows: ["1m", "5m", "30m", "1h"],
+        events: {
+          snapshot: {
+            trigger: "Fires once on join with current rankings for all four windows",
+            data_shape: "object with keys 1m/5m/30m/1h, each an array of token envelopes",
+            access_pattern: "envelope.data['1m'][i].data.token / envelope.data['1m'][i].data.pools[0]",
+          },
+          message: {
+            trigger: "Fires every ~30 seconds with a full refresh of all windows — replace, do not merge",
+            data_shape: "same as snapshot",
+            access_pattern: "same as snapshot",
+          },
+        },
+        example: `
+socket.emit("join", "trending");
+
+let trending = { "1m": [], "5m": [], "30m": [], "1h": [] };
+let activeWindow = "1m";
+
+function parseTrending(data) {
+  const result = {};
+  for (const window of ["1m", "5m", "30m", "1h"]) {
+    result[window] = (data[window] || []).map((item) => ({
+      token:  item.data.token,
+      pool:   item.data.pools[0],
+      events: item.data.events,
+      risk:   item.data.risk,
+      meta:   item.data.meta,
+    }));
+  }
+  return result;
+}
+
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === "trending") {
+    trending = parseTrending(envelope.data);
+    renderTrendingTable(trending[activeWindow]);
+  }
+});
+
+socket.on("message", (envelope) => {
+  if (envelope.room === "trending") {
+    trending = parseTrending(envelope.data);
+    renderTrendingTable(trending[activeWindow]);
+  }
+});
+
+// Switch window without re-subscribing
+function setWindow(window) {
+  activeWindow = window;
+  renderTrendingTable(trending[window]);
+}`.trim(),
+      },
+
+      "token:{mint}": {
+        description: "All state updates for a single token. Use on a token detail page. Join when the page opens, leave when it closes.",
+        auto_joined: false,
+        join: `socket.emit("join", "token:{mint}")`,
+        leave: `socket.emit("leave", "token:{mint}")`,
+        events: {
+          snapshot: {
+            trigger: "Fires once on join with the full current state of the token",
+            data_shape: "single token payload (not wrapped in an extra envelope)",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+          },
+          message: {
+            trigger: "Fires on any state change: price update, risk analysis, metadata resolved, graduation",
+            data_shape: "single token payload",
+            access_pattern: "envelope.data.token / envelope.data.pools[0]",
+          },
+          trade: {
+            trigger: "Fires on every buy or sell — lightweight, no full payload",
+            data_shape: "{ mint, signature, type: 'buy'|'sell', solAmount, maker }",
+            access_pattern: "event.type / event.solAmount / event.maker",
+          },
+        },
+        example: `
+let currentMint = null;
+
+function openTokenPage(mint) {
+  if (currentMint) {
+    socket.emit("leave", \`token:\${currentMint}\`);
+    socket.emit("leave", \`chart:\${currentMint}\`);
+  }
+  currentMint = mint;
+  socket.emit("join", \`token:\${mint}\`);
+  socket.emit("join", \`chart:\${mint}\`);
+}
+
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === \`token:\${currentMint}\`) {
+    const { token, pools, events, risk, graduation, dev_stats, meta } = envelope.data;
+    renderHeader(token);
+    renderPoolStats(pools[0]);
+    renderPriceChanges(events);
+    renderRiskPanel(risk, meta);
+    renderGraduationBar(pools[0].curvePercentage, graduation.status);
+    renderDevStats(dev_stats);
+  }
+});
+
+socket.on("message", (envelope) => {
+  if (envelope.room === \`token:\${currentMint}\`) {
+    const { pools, events, risk, graduation, meta } = envelope.data;
+    renderPoolStats(pools[0]);
+    renderPriceChanges(events);
+    renderRiskPanel(risk, meta);
+    renderGraduationBar(pools[0].curvePercentage, graduation.status);
+  }
+});
+
+socket.on("trade", (event) => {
+  if (event.mint === currentMint) {
+    appendTradeRow({
+      side:   event.type,       // "buy" | "sell"
+      sol:    event.solAmount,
+      wallet: event.maker,
+      sig:    event.signature,
+    });
+  }
+});`.trim(),
+      },
+
+      "chart:{mint}": {
+        description: "Price ticks only for a single token. Snapshot delivers up to 500 historical ticks. Each trade appends one new tick. Always used alongside token:{mint}.",
+        auto_joined: false,
+        join: `socket.emit("join", "chart:{mint}")`,
+        leave: `socket.emit("leave", "chart:{mint}")`,
+        events: {
+          snapshot: {
+            trigger: "Fires once on join with price history",
+            data_shape: "{ mint, priceHistory: [{ time, price, price_usd }] }",
+            access_pattern: "envelope.data.priceHistory",
+          },
+          chart: {
+            trigger: "Fires after every trade with a single new tick",
+            data_shape: "{ mint, tick: { time, price, price_usd } }",
+            access_pattern: "envelope.data.tick",
+          },
+        },
+        example: `
+socket.on("snapshot", (envelope) => {
+  if (envelope.room === \`chart:\${currentMint}\`) {
+    const history = envelope.data.priceHistory;
+    // history[i] = { time: ms, price: SOL, price_usd: USD }
+    initChart(history);
+  }
+});
+
+socket.on("chart", (envelope) => {
+  if (envelope.room === \`chart:\${currentMint}\`) {
+    const tick = envelope.data.tick;
+    // tick = { time: ms, price: SOL, price_usd: USD }
+    appendChartTick(tick);
+  }
+});`.trim(),
+      },
+    },
+
+    access_pattern_summary: {
+      note: "The nesting differs between snapshots (arrays) and single-item events. This is the complete reference:",
+      table: [
+        { room: "new",            event: "snapshot", access: "envelope.data[i].data.token  /  envelope.data[i].data.pools[0]" },
+        { room: "new",            event: "message",  access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "new",            event: "update",   access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "graduating",     event: "snapshot", access: "envelope.data[i].data.token  /  envelope.data[i].data.pools[0]" },
+        { room: "graduating",     event: "message",  access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "graduated",      event: "snapshot", access: "envelope.data[i].data.token  /  envelope.data[i].data.pools[0]" },
+        { room: "graduated",      event: "message",  access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "trending",       event: "snapshot", access: "envelope.data['1m'][i].data.token  /  envelope.data['1m'][i].data.pools[0]" },
+        { room: "trending",       event: "message",  access: "envelope.data['1m'][i].data.token  /  envelope.data['1m'][i].data.pools[0]" },
+        { room: "token:{mint}",   event: "snapshot", access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "token:{mint}",   event: "message",  access: "envelope.data.token  /  envelope.data.pools[0]" },
+        { room: "token:{mint}",   event: "trade",    access: "event.type  /  event.solAmount  /  event.maker  /  event.signature" },
+        { room: "chart:{mint}",   event: "snapshot", access: "envelope.data.priceHistory" },
+        { room: "chart:{mint}",   event: "chart",    access: "envelope.data.tick" },
+      ],
+    },
+
+    rest_endpoints: {
+      "GET /new": "Last 50 tokens. Same payload shape as the new room snapshot — each item is { type, room, data } so access via item.data.token",
+      "GET /api/token/:mint": "Full payload for a single token. Access directly as response.data.token",
+      "GET /api/token/:mint/history": "Extended price history. Response: { mint, count, history: [{ time, price, price_usd }] }",
+      "GET /api/stats": "Service health. Response: { status, tokensInRedis, uptime, timestamp }",
+      "GET /doc": "This document",
+    },
+
+    meta_flags: {
+      description: "Use meta flags to drive progressive loading states instead of hard-coding timers or checking if fields are zero.",
+      timeline: {
+        "~5ms":      "Skeleton broadcast — name/symbol/creator. meta.hasPrice=false",
+        "~100-500ms": "Rich broadcast — price, top10, devPercentage, devStats, snipersCount. meta.hasPrice=true, meta.hasTop10=true",
+        "~15s":      "Full risk — snipers/insiders arrays with resolved wallet owners. meta.hasRisk=true",
+        "~1-10s":    "Image resolved — IPFS/Arweave metadata. meta.hasImage=true",
+      },
+      example: `
+function renderRiskPanel(risk, meta) {
+  if (!meta.hasTop10) {
+    showSkeleton();        // holder scan still pending
+    return;
+  }
+  if (!meta.hasRisk) {
+    showPartialRisk({      // top10 + dev% available, full snipers/insiders not yet
+      top10:         risk.top10,
+      devPercentage: risk.dev.percentage,
+    });
+    return;
+  }
+  showFullRisk(risk);      // everything available
+}
+
+function renderImage(token, meta) {
+  if (!meta.hasImage) {
+    showImagePlaceholder();
+  } else {
+    showImage(token.image);
+  }
+}
+
+// Show "data delayed" if rich payload never arrived
+function checkDelay(meta) {
+  if (!meta.hasPrice && Date.now() > meta.expectedRichBy + 2000) {
+    showDelayedBanner();
+  }
+}`.trim(),
+    },
+
+    reconnect_pattern: {
+      description: "Socket.io reconnects automatically but does NOT restore room memberships. Re-join all rooms inside the connect handler.",
+      example: `
+const activeRooms = new Set();
+
+socket.on("connect", () => {
+  for (const room of activeRooms) {
+    socket.emit("join", room);
+  }
+});
+
+function joinRoom(room) {
+  activeRooms.add(room);
+  socket.emit("join", room);
+}
+
+function leaveRoom(room) {
+  activeRooms.delete(room);
+  socket.emit("leave", room);
+}`.trim(),
+    },
+  });
+});
+
 
 
 // ========== PAYLOAD BUILDER ==========
@@ -508,7 +1166,25 @@ async function buildTokenPayload(
         status: d.graduationStatus || (parseFloat(d.curvePercentage || "0") >= 80 ? "graduating" : "new")
       },
       dev_stats: safeParse(d.devStats, { total_launched: 0, total_migrated: 0 }),
-      priceHistory
+      priceHistory,
+      meta: {
+        // Completeness flags — frontend uses for progressive loading states.
+        // hasPrice:      price/liquidity populated (~100-400ms after launch)
+        // hasBasicRisk:  dev history + sniper count in same broadcast as price
+        // hasTop10:      top10 concentration + ATA dev% computed (inline or t=2s fallback)
+        // hasRisk:       full quick scan complete (superset of hasTop10)
+        // hasImage:      IPFS/Arweave metadata resolved (~500ms–3s)
+        // expectedRichBy: unix ms by which rich payload (hasPrice+hasTop10) should have arrived.
+        //                 Anchored to createdAt so it stays meaningful on re-fetches and REST calls.
+        //                 Frontend: if Date.now() > expectedRichBy && !hasPrice → show "data delayed".
+        hasPrice:        parseFloat(d.priceUsd || "0") > 0,
+        hasBasicRisk:    !!d.devStats,
+        hasTop10:        "top10" in d,
+        hasRisk:         !!(d.riskQuickScanAt || d.riskAnalyzedAt),
+        hasImage:        !!(d.image && d.image !== ""),
+        expectedRichBy:  parseInt(d.createdAt || "0") + 450,
+        richPayloadDelay: d.richPayloadMs ? parseInt(d.richPayloadMs) : null,
+      }
     }
   };
 

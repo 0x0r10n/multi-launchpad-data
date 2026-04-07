@@ -7,10 +7,120 @@ import { MOON_EXCLUDE_WALLETS } from "./launchpads";
 const redis = new Redis(process.env.REDIS_URL!);
 const connection = new Connection(process.env.SOLANA_RPC!, "confirmed");
 
+// ATA derivation — used in quick scan to find dev holdings without extra RPC
+const TOKEN_PROGRAM_ID          = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bF6");
+
+function getAssociatedTokenAddress(mint: PublicKey, owner: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+  )[0];
+}
+
 const TOKEN_TOTAL_SUPPLY = 1_000_000_000;
 const DECIMALS = 6;
 const RAW_SUPPLY = TOKEN_TOTAL_SUPPLY * Math.pow(10, DECIMALS);
 const inFlight = new Set<string>();
+
+// 5-minute cooldown — risk data doesn't change that fast between analyses
+const RISK_COOLDOWN_MS = 5 * 60_000;
+
+// ── Shared holder computation ─────────────────────────────────────────────────
+// Core of both the inline fast path and the t=2s fallback.
+// Returns null if RPC doesn't respond within timeoutMs.
+async function computeHolderFields(
+  mint: string,
+  creator: string,
+  curvePDA: string,
+  platform: string,
+  timeoutMs: number,
+): Promise<{ top10: string; devPercentage: string } | null> {
+  const mintPubkey = new PublicKey(mint);
+  const excludeWallets = platform === "moon" ? MOON_EXCLUDE_WALLETS : [];
+
+  const result = await Promise.race([
+    connection.getTokenLargestAccounts(mintPubkey).catch(() => null),
+    new Promise<null>(r => setTimeout(() => r(null), timeoutMs)),
+  ]);
+  if (!result?.value?.length) return null;
+
+  const holders = result.value
+    .filter(h => {
+      const addr = h.address.toBase58();
+      return addr !== curvePDA && !excludeWallets.includes(addr);
+    })
+    .slice(0, 10);
+
+  const top10Raw = holders.reduce((s, h) => s + Number(h.amount), 0);
+  const top10Pct = Math.min(100, (top10Raw / RAW_SUPPLY) * 100);
+
+  let devPercentage = 0;
+  if (creator) {
+    try {
+      const creatorAta = getAssociatedTokenAddress(mintPubkey, new PublicKey(creator));
+      const devHolder = result.value.find(h => h.address.toBase58() === creatorAta.toBase58());
+      if (devHolder) devPercentage = Math.min(100, (Number(devHolder.amount) / RAW_SUPPLY) * 100);
+    } catch {}
+  }
+
+  return { top10: top10Pct.toFixed(2), devPercentage: devPercentage.toFixed(2) };
+}
+
+// ── Inline holder snapshot for the new-launch hot path ───────────────────────
+// Started at t=0 in parallel with the curve race. If it resolves in time,
+// top10 + dev% appear in the same broadcast as price (~100-500ms after launch).
+// Does NOT write to Redis — the caller merges and persists.
+export function startHolderSnapshot(
+  mint: string,
+  creator: string,
+  curvePDA: string,
+  platform: string,
+): Promise<{ top10: string; devPercentage: string } | null> {
+  // 480ms internal timeout: slightly more breathing room without pushing worst-case too far.
+  // Combined with the 450ms grace window in index.ts, total holder budget = 480-930ms.
+  return computeHolderFields(mint, creator, curvePDA, platform, 480);
+}
+
+// ── Scheduled quick risk scan (t=2s fallback) ─────────────────────────────────
+// Runs only if riskQuickScanAt is not yet set — idempotent by design.
+// Adds sniper count + dev stats (Redis reads) on top of the holder fields.
+export function queueInitialQuickRisk(mint: string) {
+  initialQuickRisk(mint).catch(() => {});
+}
+
+async function initialQuickRisk(mint: string) {
+  const alreadyScanned = await redis.hget(`token:${mint}`, "riskQuickScanAt");
+  if (alreadyScanned) return; // inline snapshot already handled this
+
+  const tokenData = await redis.hgetall(`token:${mint}`);
+  if (!tokenData?.mint) return;
+
+  const holderFields = await computeHolderFields(
+    mint, tokenData.creator || "", tokenData.curvePDA || "", tokenData.platform || "pump", 3000,
+  );
+  if (!holderFields) return;
+
+  const [knownSnipers, creatorStats] = await Promise.all([
+    redis.smembers(`snipers_set:${mint}`),
+    tokenData.creator ? redis.hgetall(`creator:${tokenData.creator}`) : Promise.resolve({} as Record<string, string>),
+  ]);
+
+  const update: Record<string, string> = {
+    top10:           holderFields.top10,
+    devPercentage:   holderFields.devPercentage,
+    devStats:        JSON.stringify({
+      total_launched: parseInt(creatorStats.launched || "0"),
+      total_migrated: parseInt(creatorStats.migrated || "0"),
+    }),
+    snipersCount:    knownSnipers.length.toString(),
+    riskQuickScanAt: Date.now().toString(),
+  };
+
+  await redis.hset(`token:${mint}`, update);
+  console.log(`[Risk] ⚡ Quick scan ${tokenData.name} | top10≈${parseFloat(holderFields.top10).toFixed(1)}% dev≈${parseFloat(holderFields.devPercentage).toFixed(1)}% snipers=${knownSnipers.length}`);
+  await redis.publish("token-updates", mint);
+}
 
 export function queueRiskAnalysis(mint: string) {
   if (inFlight.has(mint)) return;
@@ -23,7 +133,7 @@ async function analyzeRisk(mint: string) {
   if (!tokenData?.mint) return;
 
   const lastAnalysis = parseInt(tokenData.riskAnalyzedAt || "0");
-  if (Date.now() - lastAnalysis < 60_000) return;
+  if (Date.now() - lastAnalysis < RISK_COOLDOWN_MS) return;
 
   const mintPubkey = new PublicKey(mint);
   const creator = tokenData.creator || "";
@@ -41,7 +151,6 @@ async function analyzeRisk(mint: string) {
   const holdersToResolve = holders.slice(0, 15);
 
   // ── Batch resolve token account owners + token supply in parallel ───────────
-  // SPL token account layout: mint[0..32] | owner[32..64] | amount[64..72] | ...
   const tokenAccountPubkeys = holdersToResolve.map(h => h.address);
   const [accountInfos, supplyInfo] = await Promise.all([
     connection.getMultipleAccountsInfo(tokenAccountPubkeys),
@@ -123,25 +232,16 @@ async function analyzeRisk(mint: string) {
   const insiderTotalPct = insiderWallets.reduce((s, w) => s + w.percentage, 0);
   const insiderTotalBal = insiderWallets.reduce((s, w) => s + w.amount, 0);
 
-  // ── Dev stats: pipeline all creator+complete lookups in one roundtrip ───────
+  // ── Dev stats: O(1) lookup via creator index (no full-table scan) ─────────
+  // Creator stats are maintained incrementally in yellowstone-manager and curve-tracker
+  // via hincrby on creator:{address} — no need to scan all tokens.
   let devStats = { total_launched: 0, total_migrated: 0 };
   if (creator) {
-    const allMints = await redis.zrange("tokens:latest", 0, -1);
-    if (allMints.length > 0) {
-      const pipeline = redis.pipeline();
-      for (const m of allMints) pipeline.hmget(`token:${m}`, "creator", "complete");
-      const results = await pipeline.exec();
-
-      let launched = 0, migrated = 0;
-      for (const r of results || []) {
-        const [c, complete] = (r?.[1] as [string, string]) || [];
-        if (c === creator) {
-          launched++;
-          if (complete === "true") migrated++;
-        }
-      }
-      devStats = { total_launched: launched, total_migrated: migrated };
-    }
+    const stats = await redis.hgetall(`creator:${creator}`);
+    devStats = {
+      total_launched: parseInt(stats.launched || "0"),
+      total_migrated: parseInt(stats.migrated || "0"),
+    };
   }
 
   // ── Write to Redis ────────────────────────────────────────────────────────
@@ -164,17 +264,4 @@ async function analyzeRisk(mint: string) {
   await redis.hset(`token:${mint}`, update);
   console.log(`[Risk] ✅ ${tokenData.name} | top10=${top10Pct.toFixed(1)}% snipers=${sniperWallets.length} (${sniperTotalPct.toFixed(1)}%) dev=${devPercentage.toFixed(1)}%`);
   await redis.publish("token-updates", mint);
-}
-
-export function startRiskAnalysisLoop() {
-  setInterval(async () => {
-    try {
-      const mints = await redis.zrevrange("tokens:latest", 0, 49);
-      for (const mint of mints) queueRiskAnalysis(mint);
-    } catch (e: any) {
-      console.error("[Risk] Loop error:", e.message);
-    }
-  }, 30_000);
-
-  console.log("[Risk] Started — analysis every 30s for top 50 tokens");
 }
