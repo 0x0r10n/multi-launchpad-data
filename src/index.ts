@@ -566,6 +566,8 @@ socket.on("disconnect", (reason) => {
           description: "string — from metadata (empty until enriched)",
           image: "string — resolved image URL (empty until IPFS resolves)",
           hasFileMetaData: "boolean — true if URI exists",
+          isMayhemMode: "boolean — true if Pump.fun Mayhem mode is active",
+          isCashbackEnabled: "boolean — true if trading cashback is enabled",
           createdOn: "string — launchpad URL",
           strictSocials: { twitter: "string", telegram: "string", website: "string" },
           creation: { creator: "string — wallet", created_tx: "string — signature", created_time: "number — unix seconds" },
@@ -979,7 +981,7 @@ socket.on("chart", (envelope) => {
     meta_flags: {
       description: "Use meta flags to drive progressive loading states instead of hard-coding timers or checking if fields are zero.",
       timeline: {
-        "~5ms":      "Skeleton broadcast — name/symbol/creator. meta.hasPrice=false",
+        "~5ms":      "Skeleton broadcast — name/symbol/creator/mayhem/cashback. meta.hasPrice=false",
         "~100-500ms": "Rich broadcast — price, top10, devPercentage, devStats, snipersCount. meta.hasPrice=true, meta.hasTop10=true",
         "~15s":      "Full risk — snipers/insiders arrays with resolved wallet owners. meta.hasRisk=true",
         "~1-10s":    "Image resolved — IPFS/Arweave metadata. meta.hasImage=true",
