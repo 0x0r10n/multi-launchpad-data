@@ -36,7 +36,21 @@ export function parseNameSymbolUri(data: Buffer, offset = 8): TokenMetadata | nu
     const name   = readStr();
     const symbol = readStr();
     const uri    = readStr();
-    if (name && symbol) return { name, symbol, uri: uri || "" };
+    if (!name || !symbol) return null;
+
+    let isMayhemMode = false;
+    let isCashbackEnabled = false;
+
+    // Pump.fun CreateV2 / Mayhem logic: Try to jump ahead to flags if buffer is large enough
+    // Layout after uri: [32 mint][32 bc][32 user][32 creator][8 ts][32 reserves][32 tokenpg][1 mayhem][1 cashback]
+    const EXTRA_PUMP_FIELDS_LEN = (32 * 5) + 8 + 32 + 2; 
+    if (pos + EXTRA_PUMP_FIELDS_LEN <= data.length) {
+      const skipToFlags = pos + (32 * 5) + 8 + 32;
+      isMayhemMode = data[skipToFlags] === 1;
+      isCashbackEnabled = data[skipToFlags + 1] === 1;
+    }
+
+    return { name, symbol, uri: uri || "", isMayhemMode, isCashbackEnabled };
   } catch {}
   return null;
 }

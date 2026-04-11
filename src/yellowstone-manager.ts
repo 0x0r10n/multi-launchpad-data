@@ -247,15 +247,17 @@ export class YellowstoneManager extends EventEmitter {
 
       const tokenData: Record<string, string> = {
         mint,
-        creator:   maker,
+        creator:           maker,
         curvePDA,
-        platform:  finalPlatformId,
+        platform:          finalPlatformId,
         name,
         symbol,
-        uri:       parsed.uri || "",
-        decimals:  "6",
-        createdAt: Date.now().toString(),
-        createdTx: signature,
+        uri:               parsed.uri || "",
+        isMayhemMode:      parsed.isMayhemMode ? "true" : "false",
+        isCashbackEnabled: parsed.isCashbackEnabled ? "true" : "false",
+        decimals:          "6",
+        createdAt:         Date.now().toString(),
+        createdTx:         signature,
         slot,
       };
 

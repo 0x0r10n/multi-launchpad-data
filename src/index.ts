@@ -1080,6 +1080,8 @@ async function buildTokenPayload(
         description: d.description || "",
         image: d.image || "",
         hasFileMetaData: !!(d.uri),
+        isMayhemMode: d.isMayhemMode === "true",
+        isCashbackEnabled: d.isCashbackEnabled === "true",
         createdOn: platform === "moon" ? "https://moon.it" : platform === "bags" ? "https://bags.fm" : platform === "letsbonk" ? "https://letsbonk.fun" : platform === "launchlab" ? "https://raydium.io/launchlab" : "https://pump.fun",
         strictSocials: {
           twitter: d.twitter || "",

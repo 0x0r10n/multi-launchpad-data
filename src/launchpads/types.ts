@@ -1,9 +1,11 @@
 // src/launchpads/types.ts
 
 export interface TokenMetadata {
-  name:   string;
-  symbol: string;
-  uri:    string;
+  name:               string;
+  symbol:             string;
+  uri:                string;
+  isMayhemMode?:      boolean;
+  isCashbackEnabled?: boolean;
 }
 
 export interface CurveState {

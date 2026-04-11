@@ -1,4 +1,4 @@
- (Yellowstone Geyser Multi-Launchpad Indexer)
+# sol-indexer (Yellowstone Geyser Multi-Launchpad Indexer)
 
 > Ultra-low-latency Solana token detection and enrichment pipeline for multiple launchpads, using Yellowstone gRPC.
 
