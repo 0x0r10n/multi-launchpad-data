@@ -10,8 +10,7 @@ const PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 // Stable across Pump.fun deployments — prefer over log string.
 const CREATE_DISC = "181ec828051c0777";
 
-const LAMPORTS             = 1_000_000_000;
-const GRADUATION_TARGET    = 85; // realSolReserves target in SOL
+const GRADUATION_TARGET_LAMPORTS = 85n * 1_000_000_000n; // 85 SOL in lamports
 
 export const PumpParser: LaunchpadParser = {
   id:             "pump",
@@ -65,7 +64,7 @@ export const PumpParser: LaunchpadParser = {
     const realTokenReserves    = readU64(data, 24);
     const realSolReserves      = readU64(data, 32);
     const complete             = data[48] === 1;
-    const curvePercentage      = Math.min(100, (realSolReserves / LAMPORTS / GRADUATION_TARGET) * 100);
+    const curvePercentage      = Math.min(100, Number(realSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };
   },
 };

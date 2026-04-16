@@ -150,12 +150,10 @@ async function analyzeRisk(mint: string) {
   const holders = largestAccounts.value;
   const holdersToResolve = holders.slice(0, 15);
 
-  // ── Batch resolve token account owners + token supply in parallel ───────────
+  // ── Batch resolve token account owners ──────────────────────────────────────
+  // Supply is always RAW_SUPPLY (1B × 10^6) for all indexed tokens — no RPC needed.
   const tokenAccountPubkeys = holdersToResolve.map(h => h.address);
-  const [accountInfos, supplyInfo] = await Promise.all([
-    connection.getMultipleAccountsInfo(tokenAccountPubkeys),
-    connection.getTokenSupply(mintPubkey).catch(() => null),
-  ]);
+  const accountInfos = await connection.getMultipleAccountsInfo(tokenAccountPubkeys);
 
   const resolvedHolders = holdersToResolve.map((holder, i) => {
     const data = accountInfos[i]?.data;
@@ -186,7 +184,7 @@ async function analyzeRisk(mint: string) {
   // ── Top 10 concentration ──────────────────────────────────────────────────
   const top10RawAmount = validHolders.slice(0, 10).reduce((sum, h) => sum + h.rawAmount, 0);
 
-  const totalSupplyRaw = supplyInfo ? Number(supplyInfo.value.amount) : RAW_SUPPLY;
+  const totalSupplyRaw = RAW_SUPPLY;
 
   const top10Pct = totalSupplyRaw > 0
     ? Math.min(Math.max((top10RawAmount / totalSupplyRaw) * 100, 0), 100)

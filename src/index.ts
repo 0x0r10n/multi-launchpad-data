@@ -60,6 +60,10 @@ io.on("connection", (socket) => {
   // Auto-join "new" room — client gets future new-launch events immediately
   socket.join("new");
 
+  socket.on("leave", (room: string) => {
+    socket.leave(room);
+  });
+
   socket.on("join", async (room: string) => {
     socket.join(room);
 
@@ -149,7 +153,7 @@ async function broadcastChartTick(mint: string) {
 
 // ── Geyser curve account update handler ─────────────────────────────────────
 yellowstone.on("curve-update", async (event: any) => {
-  const fields = await processCurveAccountUpdate(event.mint, event.data, event.platform);
+  const fields = await processCurveAccountUpdate(event.mint, event.data, event.platform, event.isStartup);
 
   // Resolve pending first-curve race if the new-launch handler is still waiting
   const resolver = pendingFirstCurve.get(event.mint);
@@ -286,15 +290,16 @@ yellowstone.on("trade", async (data: any) => {
   broadcastChartTick(data.mint);
 
   try {
-    const createdAt = await redis.hget(`token:${data.mint}`, "createdAt");
-    if (createdAt && data.type === "buy" && data.maker) {
-      const ageMs = Date.now() - parseInt(createdAt);
-      // Sniper logic: any buy within first 20 seconds is a sniper
-      // (Using 20s as Moon.it and Pump.fun have varying immediate launch activity)
-      if (ageMs <= 20_000) {
-        await redis.sadd(`snipers_set:${data.mint}`, data.maker);
-        // Expiry of 12h for Redis memory hygiene
-        await redis.expire(`snipers_set:${data.mint}`, 43_200); 
+    if (data.type === "buy" && data.maker && data.slot != null) {
+      const launchSlotStr = await redis.hget(`token:${data.mint}`, "slot");
+      if (launchSlotStr) {
+        // Use slot delta instead of wall clock — immune to indexer latency and restarts.
+        // One slot ≈ 400ms, so 50 slots ≈ 20s.
+        const slotDiff = Number(data.slot) - parseInt(launchSlotStr);
+        if (slotDiff >= 0 && slotDiff <= 50) {
+          await redis.sadd(`snipers_set:${data.mint}`, data.maker);
+          await redis.expire(`snipers_set:${data.mint}`, 43_200);
+        }
       }
     }
   } catch (err) {}
@@ -341,7 +346,7 @@ subscriber.on("message", async (channel, mint) => {
 // Scan tokens:latest and return full payloads for a given graduationStatus.
 // Uses a Redis pipeline so N tokens = 1 roundtrip for the status filter.
 async function getTokensByStatus(status: string): Promise<any[]> {
-  const mints = await redis.zrevrange("tokens:latest", 0, 199);
+  const mints = await redis.zrevrange("tokens:latest", 0, 499);
   if (!mints.length) return [];
 
   const pipeline = redis.pipeline();
@@ -351,9 +356,13 @@ async function getTokensByStatus(status: string): Promise<any[]> {
   const matchingMints = mints.filter((_, i) => results?.[i]?.[1] === status);
   if (!matchingMints.length) return [];
 
-  const tokenDatas = await Promise.all(matchingMints.map(m => redis.hgetall(`token:${m}`)));
+  // Pipeline all hgetall calls into a single round-trip
+  const hashPipeline = redis.pipeline();
+  for (const mint of matchingMints) hashPipeline.hgetall(`token:${mint}`);
+  const hashResults = await hashPipeline.exec();
+  const tokenDatas = hashResults?.map(r => r?.[1] as Record<string, string> | null) ?? [];
   const payloads = await Promise.all(
-    tokenDatas.filter(d => d?.mint).map(d => buildTokenPayload(d)),
+    tokenDatas.filter(d => d?.mint).map(d => buildTokenPayload(d!)),
   );
   return payloads;
 }
@@ -394,7 +403,7 @@ const TRENDING_WINDOWS: Record<string, number> = {
 // One pipeline call to fetch all trade data, then volume is computed in-memory per window.
 async function calculateTrendingTokens(): Promise<Record<string, any[]>> {
   const empty = { "1m": [], "5m": [], "30m": [], "1h": [] };
-  const mints = await redis.zrevrange("tokens:latest", 0, 199);
+  const mints = await redis.zrevrange("tokens:latest", 0, 499);
   if (!mints.length) return empty;
 
   const now = Date.now();
@@ -445,13 +454,17 @@ async function calculateTrendingTokens(): Promise<Record<string, any[]>> {
     for (const m of ranked) neededMints.add(m);
   }
 
-  // Fetch token data for all unique mints that appear in any window — deduplicated
+  // Fetch token data for all unique mints that appear in any window — deduplicated.
+  // Pipeline all hgetall calls into a single round-trip (up to 200 mints).
   const uniqueMints = [...neededMints];
-  const tokenDatas = await Promise.all(uniqueMints.map(m => redis.hgetall(`token:${m}`)));
+  const trendPipeline = redis.pipeline();
+  for (const mint of uniqueMints) trendPipeline.hgetall(`token:${mint}`);
+  const trendResults = await trendPipeline.exec();
+  const uniqueTokenDatas = trendResults?.map(r => r?.[1] as Record<string, string> | null) ?? [];
 
   const payloadMap = new Map<string, any>();
   await Promise.all(uniqueMints.map(async (m, i) => {
-    const d = tokenDatas[i];
+    const d = uniqueTokenDatas[i];
     if (d?.mint) payloadMap.set(m, await buildTokenPayload(d));
   }));
 
@@ -1202,5 +1215,25 @@ function safeParse(json: string | undefined, fallback: any): any {
   if (!json) return fallback;
   try { return JSON.parse(json); } catch { return fallback; }
 }
+
+// ── Global error safety net ───────────────────────────────────────────────────
+// Node.js v15+ crashes on unhandled promise rejections by default.
+// Geyser h2 transport resets (INTERNAL_ERROR from Chainstack) can leak past the
+// stream 'error' event handler as raw thrown exceptions. Catch them here so the
+// process survives and the built-in reconnect logic handles recovery.
+process.on("unhandledRejection", (reason: any) => {
+  console.error("[Process] Unhandled rejection:", reason?.message || reason);
+  // If it looks like a Geyser transport error, trigger a reconnect
+  const msg = String(reason?.message || reason || "");
+  if (msg.includes("h2 protocol") || msg.includes("transport error") || msg.includes("gRPC")) {
+    console.error("[Process] Geyser transport error — triggering reconnect via manager");
+    yellowstone.start().catch(() => {});
+  }
+});
+
+process.on("uncaughtException", (err: Error) => {
+  console.error("[Process] Uncaught exception:", err.message);
+  // Don't exit — let the reconnect logic recover
+});
 
 console.log("✅ sol-indexer started — Pump.fun live via Yellowstone");

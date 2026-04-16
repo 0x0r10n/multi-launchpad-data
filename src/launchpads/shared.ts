@@ -102,9 +102,9 @@ export function detectSwapFromDelta(meta: any): "buy" | "sell" | null {
 
 // ── Binary helpers ────────────────────────────────────────────────────────────
 
-/** Read a little-endian u64 from buffer at offset (returns JS number) */
-export function readU64(buf: Buffer, offset: number): number {
-  const lo = buf.readUInt32LE(offset);
-  const hi = buf.readUInt32LE(offset + 4);
-  return hi * 0x100000000 + lo;
+/** Read a little-endian u64 from buffer at offset (returns bigint — safe for full u64 range) */
+export function readU64(buf: Buffer, offset: number): bigint {
+  const lo = BigInt(buf.readUInt32LE(offset));
+  const hi = BigInt(buf.readUInt32LE(offset + 4));
+  return (hi << 32n) | lo;
 }

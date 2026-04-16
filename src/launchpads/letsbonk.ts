@@ -35,11 +35,9 @@ export const LetsBonkParser: LaunchpadParser = {
   },
 
   detectSwap(logs, meta) {
-    // Case-insensitive matching + SOL balance delta fallback (LaunchLab logs are not
-    // as explicit as Pump.fun)
     for (const l of logs) {
-      if (l.includes("Buy")  || l.includes("buy"))  return "buy";
-      if (l.includes("Sell") || l.includes("sell")) return "sell";
+      if (l.includes("Instruction: Buy")  || l.includes("Instruction: buy"))  return "buy";
+      if (l.includes("Instruction: Sell") || l.includes("Instruction: sell")) return "sell";
     }
     return detectSwapFromDelta(meta);
   },
@@ -76,9 +74,9 @@ export const LetsBonkParser: LaunchpadParser = {
     if (data.length < 32) return null;
     const virtualTokenReserves = readU64(data, 8);
     const virtualSolReserves   = readU64(data, 24);
-    const realTokenReserves    = 0;
-    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0;
-    const curvePercentage      = Math.min(100, Number(BigInt(virtualSolReserves) * 100n / GRADUATION_TARGET_LAMPORTS));
+    const realTokenReserves    = 0n;
+    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0n;
+    const curvePercentage      = Math.min(100, Number(virtualSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
     const complete             = curvePercentage >= 100;
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };
   },

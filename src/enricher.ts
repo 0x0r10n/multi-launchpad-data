@@ -94,12 +94,16 @@ async function enrichToken(mint: string) {
 export function startEnrichmentSweep() {
   setInterval(async () => {
     try {
-      const mints = await redis.zrevrange("tokens:latest", 0, 49);
+      const mints = await redis.zrevrange("tokens:latest", 0, 199);
       let retried = 0;
-      for (const mint of mints) {
-        const [image, name, symbol] = await redis.hmget(`token:${mint}`, "image", "name", "symbol");
+      // Pipeline all 50 hmget calls into a single round-trip
+      const pipeline = redis.pipeline();
+      for (const mint of mints) pipeline.hmget(`token:${mint}`, "image", "name", "symbol");
+      const results = await pipeline.exec();
+      for (let i = 0; i < mints.length; i++) {
+        const [image, name, symbol] = (results?.[i]?.[1] as string[] | null) ?? [];
         if (!image || image === "" || !name || name === "" || name === "Unknown Token" || !symbol || symbol === "" || symbol === "???") {
-          enrichToken(mint).catch(() => {});
+          enrichToken(mints[i]).catch(() => {});
           retried++;
         }
       }

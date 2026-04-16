@@ -44,13 +44,17 @@ async function buildCurveUpdate(
   tokenData: Record<string, string>,
   solPrice: number,
 ): Promise<Record<string, string>> {
-  const { virtualTokenReserves, virtualSolReserves, realSolReserves, complete, curvePercentage } = decoded;
+  const { complete, curvePercentage } = decoded;
+  // Convert bigint reserves to number for floating-point price arithmetic
+  const virtualTokenReservesN = Number(decoded.virtualTokenReserves);
+  const virtualSolReservesN   = Number(decoded.virtualSolReserves);
+  const realSolReservesN      = Number(decoded.realSolReserves);
 
-  const priceInSol = virtualSolReserves > 0 && virtualTokenReserves > 0
-    ? (virtualSolReserves / LAMPORTS_PER_SOL) / (virtualTokenReserves / Math.pow(10, TOKEN_DECIMALS))
+  const priceInSol = virtualSolReservesN > 0 && virtualTokenReservesN > 0
+    ? (virtualSolReservesN / LAMPORTS_PER_SOL) / (virtualTokenReservesN / Math.pow(10, TOKEN_DECIMALS))
     : 0;
 
-  const liquiditySol = virtualSolReserves / LAMPORTS_PER_SOL;
+  const liquiditySol = virtualSolReservesN / LAMPORTS_PER_SOL;
   const marketCapSol = priceInSol * TOTAL_SUPPLY;
   const volume24h    = await calcVolume24h(mint, Date.now() - 86_400_000);
 
@@ -67,9 +71,9 @@ async function buildCurveUpdate(
     marketCapQuote:       marketCapSol.toFixed(4),
     marketCapUsd:         (marketCapSol * solPrice).toFixed(2),
     curvePercentage:      curvePercentage.toFixed(2),
-    virtualTokenReserves: virtualTokenReserves.toString(),
-    virtualSolReserves:   virtualSolReserves.toString(),
-    realSolReserves:      realSolReserves.toString(),
+    virtualTokenReserves: virtualTokenReservesN.toString(),
+    virtualSolReserves:   virtualSolReservesN.toString(),
+    realSolReserves:      realSolReservesN.toString(),
     complete:             complete ? "true" : "false",
     volumeUsd:            (parseFloat(tokenData.volume || "0") * solPrice).toFixed(2),
     volume24h:            volume24h.toFixed(6),
@@ -115,6 +119,7 @@ export async function processCurveAccountUpdate(
   mint: string,
   data: Buffer,
   platform: string,
+  isStartup = false,
 ): Promise<Record<string, string> | null> {
   const decoded = decodeCurveAccount(data, platform);
   if (!decoded) return null;
@@ -135,7 +140,10 @@ export async function processCurveAccountUpdate(
 
   if (tokenData?.mint) {
     await redis.hset(`token:${mint}`, update);
-    await redis.publish("token-updates", mint);
+    // Skip broadcast for startup state seeding — clients don't need spurious updates on reconnect
+    if (!isStartup) {
+      await redis.publish("token-updates", mint);
+    }
   }
   return update;
 }
@@ -148,6 +156,19 @@ let solPriceLastFetch = 0;
 async function getSolPrice(): Promise<number> {
   if (Date.now() - solPriceLastFetch < 30_000 && cachedSolPrice > 0) return cachedSolPrice;
 
+  // Jupiter first — public, stable API
+  try {
+    const res = await fetch("https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112");
+    const json: any = await res.json();
+    const price = json["So11111111111111111111111111111111111111112"]?.usdPrice;
+    if (price) {
+      cachedSolPrice = price;
+      solPriceLastFetch = Date.now();
+      return cachedSolPrice;
+    }
+  } catch {}
+
+  // Fallback: pump.fun internal API (undocumented — may change without notice)
   try {
     const res = await fetch("https://frontend-api-v3.pump.fun/sol-price");
     if (res.ok) {
@@ -157,17 +178,6 @@ async function getSolPrice(): Promise<number> {
         solPriceLastFetch = Date.now();
         return cachedSolPrice;
       }
-    }
-  } catch {}
-
-  try {
-    const res = await fetch("https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112");
-    const json: any = await res.json();
-    const price = json["So11111111111111111111111111111111111111112"]?.usdPrice;
-    if (price) {
-      cachedSolPrice = price;
-      solPriceLastFetch = Date.now();
-      return cachedSolPrice;
     }
   } catch {}
 

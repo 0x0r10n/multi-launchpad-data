@@ -31,10 +31,10 @@ export const MoonParser: LaunchpadParser = {
   },
 
   detectSwap(logs, meta) {
-    // Moon.it logs are not as explicit as Pump.fun — use loose matching + delta fallback
+    // Anchor to "Instruction:" to avoid matching arbitrary log content containing "Buy"/"Sell"
     for (const l of logs) {
-      if (l.includes("Buy")  || l.includes("buy"))  return "buy";
-      if (l.includes("Sell") || l.includes("sell")) return "sell";
+      if (l.includes("Instruction: Buy")  || l.includes("Instruction: buy"))  return "buy";
+      if (l.includes("Instruction: Sell") || l.includes("Instruction: sell")) return "sell";
     }
     return detectSwapFromDelta(meta);
   },
@@ -62,9 +62,9 @@ export const MoonParser: LaunchpadParser = {
     if (data.length < 24) return null;
     const virtualTokenReserves = readU64(data, 8);
     const virtualSolReserves   = readU64(data, 16);
-    const realTokenReserves    = data.length >= 32 ? readU64(data, 24) : 0;
-    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0;
-    const curvePercentage      = Math.min(100, Number(BigInt(virtualSolReserves) * 100n / GRADUATION_TARGET_LAMPORTS));
+    const realTokenReserves    = data.length >= 32 ? readU64(data, 24) : 0n;
+    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0n;
+    const curvePercentage      = Math.min(100, Number(virtualSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
     const complete             = curvePercentage >= 100;
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };
   },

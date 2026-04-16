@@ -38,41 +38,49 @@ export async function recordPrice(mint: string) {
   await calcPriceEvents(mint);
 }
 
-// Calculate price change percentages for all intervals
+// Calculate price change percentages for all intervals.
+// Uses a per-interval reference-price anchor stored in the token hash — O(1) per trade
+// instead of reading the full price tick list.
+// priceRef_{interval}   = price_usd at the start of the current window
+// priceRefTs_{interval} = epoch ms when that anchor was captured
+// The anchor rolls forward once it ages past the interval so the window slides naturally.
 export async function calcPriceEvents(mint: string) {
-  const priceStr = await redis.hget(`token:${mint}`, "priceUsd");
-  if (!priceStr) return;
+  // Single round-trip: current price + all 7 reference anchors (15 fields total)
+  const fields: string[] = ["priceUsd"];
+  for (const interval of Object.keys(INTERVALS)) {
+    fields.push(`priceRef_${interval}`, `priceRefTs_${interval}`);
+  }
+  const values = await redis.hmget(`token:${mint}`, ...fields);
 
+  const priceStr = values[0];
+  if (!priceStr) return;
   const currentPrice = parseFloat(priceStr);
   if (currentPrice <= 0) return;
 
-  // Get all ticks from the list
-  const raw = await redis.lrange(`price:${mint}`, 0, -1);
-  if (raw.length === 0) return;
-
-  const ticks = raw.map(r => JSON.parse(r));
   const now = Date.now();
   const updates: Record<string, string> = {};
 
+  let idx = 1;
   for (const [interval, ms] of Object.entries(INTERVALS)) {
-    const targetTime = now - ms;
+    const refPrice = values[idx]     ? parseFloat(values[idx]!)     : 0;
+    const refTs    = values[idx + 1] ? parseInt(values[idx + 1]!)   : 0;
+    idx += 2;
 
-    // Find the oldest tick that is still within this interval
-    // (the first tick whose timestamp >= targetTime)
-    let oldTick = null;
-    for (const t of ticks) {
-      if (t.time >= targetTime) {
-        oldTick = t;
-        break;
-      }
+    if (!refTs || !refPrice) {
+      // First trade for this token — set anchor, no change yet
+      updates[`priceRef_${interval}`]   = currentPrice.toString();
+      updates[`priceRefTs_${interval}`] = now.toString();
+      updates[interval] = "0";
+      continue;
     }
 
-    if (oldTick) {
-      const oldPrice = oldTick.price_usd || 0;
-      if (oldPrice > 0) {
-        const pctChange = ((currentPrice - oldPrice) / oldPrice) * 100;
-        updates[interval] = pctChange.toFixed(2);
-      }
+    const pctChange = ((currentPrice - refPrice) / refPrice) * 100;
+    updates[interval] = pctChange.toFixed(2);
+
+    // Roll the anchor forward once the current reference is older than the interval
+    if (now - refTs >= ms) {
+      updates[`priceRef_${interval}`]   = currentPrice.toString();
+      updates[`priceRefTs_${interval}`] = now.toString();
     }
   }
 
@@ -94,13 +102,13 @@ export async function getPriceHistory(mint: string, limit: number = 100): Promis
 export function startPriceTracker() {
   setInterval(async () => {
     try {
-      const mints = await redis.zrevrange("tokens:latest", 0, 49);
-      for (const mint of mints) {
-        const complete = await redis.hget(`token:${mint}`, "complete");
-        if (complete === "true") continue;
-
-        await recordPrice(mint);
-      }
+      const mints = await redis.zrevrange("tokens:latest", 0, 199);
+      // Pipeline the complete check, then run all recordPrice calls in parallel
+      const pipeline = redis.pipeline();
+      for (const mint of mints) pipeline.hget(`token:${mint}`, "complete");
+      const results = await pipeline.exec();
+      const activeMints = mints.filter((_, i) => (results?.[i]?.[1] as string) !== "true");
+      await Promise.all(activeMints.map(mint => recordPrice(mint)));
     } catch (e: any) {
       console.error("[PriceTracker] Error:", e.message);
     }

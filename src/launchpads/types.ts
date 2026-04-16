@@ -9,10 +9,10 @@ export interface TokenMetadata {
 }
 
 export interface CurveState {
-  virtualTokenReserves: number;
-  virtualSolReserves:   number;
-  realTokenReserves:    number;
-  realSolReserves:      number;
+  virtualTokenReserves: bigint;
+  virtualSolReserves:   bigint;
+  realTokenReserves:    bigint;
+  realSolReserves:      bigint;
   complete:             boolean;
   curvePercentage:      number;
 }

@@ -1,107 +1,120 @@
-import Redis from 'ioredis';
-import { Connection, PublicKey } from '@solana/web3.js';
-import 'dotenv/config';
+// src/dev-stats.ts — Historical on-chain dev stat bootstrap
+//
+// The live incremental system (yellowstone-manager / curve-tracker) tracks launched/migrated
+// in real time via hincrby on creator:{address}. But that only covers events seen since the
+// indexer started — a creator who launched 20 tokens last month would show launched=0.
+//
+// This module fills in the historical gap using two RPC calls:
+//   1. getSignaturesForAddress  — fetch up to 200 recent signatures  (1 RPC)
+//   2. getTransactions (batch)  — fetch all those txs at once         (1 RPC per 256-chunk)
+//
+// Counts are merged with max(bootstrap, live) so live tracking is never downgraded.
+// A bootstrapAt timestamp in creator:{address} prevents re-scanning within 24h.
 
-const redis = new Redis(process.env.REDIS_URL!);
+import { Connection, PublicKey } from "@solana/web3.js";
+import Redis from "ioredis";
+import "dotenv/config";
+import { LAUNCHPAD_PROGRAM_IDS } from "./launchpads";
 
-const RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
-const connection = new Connection(RPC, 'confirmed');
+const redis      = new Redis(process.env.REDIS_URL!);
+const connection = new Connection(process.env.SOLANA_RPC!, "confirmed");
 
-export const devStatsCache = new Map<string, {launched: number, migrated: number}>(); // in-memory fast path
+const BOOTSTRAP_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 h
+const SIGNATURE_LIMIT       = 200;                  // max signatures to scan per creator
+const BATCH_SIZE            = 256;                  // getTransactions max per call
 
-export async function updateDevStats(creator: string, action: 'launched' | 'migrated', io?: any) {
-  const key = creator;
-  let stats = devStatsCache.get(key) || { launched: 0, migrated: 0 };
+// ── Create signals — same precise strings used by each parser's isCreate() ───
+// These are Anchor instruction logs emitted by the launchpad programs themselves.
+const CREATE_SIGNALS = [
+  "Instruction: Create",        // Pump.fun
+  "Instruction: InitializeV2",  // LaunchLab / LetsBonk
+  "Instruction: Initialize",    // Moon.it / Bags.fm / Meteora DBC
+];
 
-  // If not in cache, fallback to Redis check
-  if (!devStatsCache.has(key)) {
-    const redisStats = await redis.hgetall(`dev_stats:${creator}`);
-    if (redisStats && Object.keys(redisStats).length > 0) {
-      stats = { 
-        launched: parseInt(redisStats.total_launched || '0'), 
-        migrated: parseInt(redisStats.total_migrated || '0') 
-      };
+// ── Migration signals — same strings used by yellowstone-manager isMigrationTx ─
+const MIGRATE_SIGNALS = [
+  "Instruction: Migrate",       // Pump.fun + LaunchLab fallback
+  "MigrateToAmm",               // LaunchLab / LetsBonk
+  "migrate_to_amm",
+  "Instruction: MigrateFunds",
+];
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Fire-and-forget bootstrap — safe to call on every new-launch.
+ * Does nothing if the creator was already bootstrapped within 24h.
+ */
+export function bootstrapDevStatsIfNeeded(creator: string): void {
+  redis.hget(`creator:${creator}`, "bootstrapAt")
+    .then(ts => {
+      if (ts && Date.now() - parseInt(ts) < BOOTSTRAP_COOLDOWN_MS) return;
+      _bootstrap(creator).catch(() => {});
+    })
+    .catch(() => {});
+}
+
+// ── Internal ──────────────────────────────────────────────────────────────────
+
+async function _bootstrap(creator: string): Promise<void> {
+  // 1. Get recent signatures for the creator wallet (1 RPC)
+  const sigInfos = await connection
+    .getSignaturesForAddress(new PublicKey(creator), { limit: SIGNATURE_LIMIT })
+    .catch(() => null);
+
+  if (!sigInfos?.length) {
+    await redis.hset(`creator:${creator}`, { bootstrapAt: Date.now().toString() });
+    return;
+  }
+
+  // Only bother fetching successful transactions
+  const signatures = sigInfos.filter(s => !s.err).map(s => s.signature);
+  if (!signatures.length) {
+    await redis.hset(`creator:${creator}`, { bootstrapAt: Date.now().toString() });
+    return;
+  }
+
+  // 2. Batch fetch transactions — BATCH_SIZE per call (1–2 RPCs for 200 sigs)
+  const allTxs: any[] = [];
+  for (let i = 0; i < signatures.length; i += BATCH_SIZE) {
+    const chunk = signatures.slice(i, i + BATCH_SIZE);
+    const txs = await connection
+      .getTransactions(chunk, { maxSupportedTransactionVersion: 0, commitment: "confirmed" })
+      .catch(() => null);
+    if (txs) allTxs.push(...txs);
+  }
+
+  let launched = 0;
+  let migrated = 0;
+
+  for (const tx of allTxs) {
+    if (!tx?.meta?.logMessages) continue;
+    const logs: string[] = tx.meta.logMessages;
+    const logStr = logs.join(" ");
+
+    // Skip transactions that don't touch any known launchpad program
+    if (!LAUNCHPAD_PROGRAM_IDS.some(id => logStr.includes(id))) continue;
+
+    if (logs.some(l => CREATE_SIGNALS.some(s => l.includes(s)))) {
+      launched++;
+    } else if (logs.some(l => MIGRATE_SIGNALS.some(s => l.includes(s)))) {
+      migrated++;
     }
   }
 
-  if (action === 'launched') stats.launched++;
-  else stats.migrated++;
+  // Merge with live-tracked counts — never downgrade what the live system already knows
+  const existing = await redis.hgetall(`creator:${creator}`).catch(() => ({} as Record<string, string>));
+  const liveLaunched = parseInt(existing.launched || "0");
+  const liveMigrated = parseInt(existing.migrated || "0");
 
-  devStatsCache.set(key, stats);
-
-  // Persist to Redis
-  await redis.hmset(`dev_stats:${creator}`, {
-    creator,
-    total_launched: stats.launched.toString(),
-    total_migrated: stats.migrated.toString(),
-    last_updated: Date.now().toString()
+  await redis.hset(`creator:${creator}`, {
+    launched:    Math.max(launched, liveLaunched).toString(),
+    migrated:    Math.max(migrated, liveMigrated).toString(),
+    bootstrapAt: Date.now().toString(),
   });
 
-  // Broadcast to specific wallet room
-  if (io) {
-    const payload = { type: 'dev-stats', wallet: creator, data: stats };
-    io.to(`dev-stats:${creator}`).emit('message', payload);
-    io.emit('message', payload); 
-  }
+  console.log(
+    `[DevStats] ${creator.slice(0, 8)} | launched=${Math.max(launched, liveLaunched)} migrated=${Math.max(migrated, liveMigrated)}` +
+    ` (scanned ${allTxs.length} txs, found ${launched}L ${migrated}M on-chain)`,
+  );
 }
-
-export async function bootstrapDevStats(creator: string) {
-  // 1. Idempotent Guard: Check for recent update (24 hour cooldown)
-  const lastUpdated = await redis.hget(`dev_stats:${creator}`, 'last_updated');
-
-  if (lastUpdated && Date.now() - parseInt(lastUpdated) < 86400000) {
-    if (devStatsCache.has(creator)) return devStatsCache.get(creator)!;
-    const redisStats = await redis.hgetall(`dev_stats:${creator}`);
-    if (redisStats && Object.keys(redisStats).length > 0) {
-      const result = { 
-        launched: parseInt(redisStats.total_launched || '0'), 
-        migrated: parseInt(redisStats.total_migrated || '0') 
-      };
-      devStatsCache.set(creator, result);
-      return result;
-    }
-  }
-
-  try {
-    // 2. Standard RPC Bootstrap (Helius-free)
-    const sigs = await connection.getSignaturesForAddress(new PublicKey(creator), { limit: 100 });
-    
-    let launched = 0, migrated = 0;
-
-    for (const sigInfo of sigs) {
-      const tx = await connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
-      if (!tx || !tx.meta) continue;
-
-      const logs = (tx.meta.logMessages || []).join(' ').toLowerCase();
-      
-      const isCreate = 
-        logs.includes('initialize') || 
-        logs.includes('create') || 
-        logs.includes('mint');
-
-      const isComplete = 
-        logs.includes('complete') || 
-        logs.includes('graduated') || 
-        logs.includes('migrate') ||
-        (logs.includes('pool created') && logs.includes('raydium'));
-
-      if (isCreate) launched++;
-      if (isComplete) migrated++;
-    }
-
-    await redis.hmset(`dev_stats:${creator}`, {
-      creator,
-      total_launched: launched.toString(),
-      total_migrated: migrated.toString(),
-      last_updated: Date.now().toString()
-    });
-
-    const stats = { launched, migrated };
-    devStatsCache.set(creator, stats);
-    return stats;
-  } catch (err: any) {
-    console.error(`[DevStats] Bootstrap failed for ${creator}:`, err.message);
-    return { launched: 0, migrated: 0 };
-  }
-}
-
