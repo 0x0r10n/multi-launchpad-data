@@ -71,7 +71,12 @@ export const LAUNCHPAD_PROGRAM_IDS: string[] = [
  */
 export function detectParser(meta: any, message: any): LaunchpadParser | null {
   const logStr     = (meta?.logMessages || []).join(" ");
-  const accountKeys: string[] = (message?.accountKeys || []).map((k: any) => bs58.encode(k));
+  // Include ALT-loaded addresses (versioned txs) so LetsBonk config account is found
+  // even when it lives in an Address Lookup Table rather than the static key list.
+  const staticKeys: string[] = (message?.accountKeys || []).map((k: any) => bs58.encode(k));
+  const loadedWritable: string[] = (meta?.loadedWritableAddresses || []).map((k: any) => bs58.encode(k));
+  const loadedReadonly: string[] = (meta?.loadedReadonlyAddresses || []).map((k: any) => bs58.encode(k));
+  const accountKeys = [...staticKeys, ...loadedWritable, ...loadedReadonly];
 
   // LetsBonk / LaunchLab — checked first since they share a program ID
   const hasLaunchLab =

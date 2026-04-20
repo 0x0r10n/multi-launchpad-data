@@ -11,7 +11,7 @@
 
 import { PublicKey } from "@solana/web3.js";
 import { LaunchpadParser, CurveState } from "./types";
-import { extractMetadataFromTx, detectSwapFromDelta, readU64, parseNameSymbolUri, collectInstructions } from "./shared";
+import { extractMetadataFromTx, detectSwapFromDelta, extractPoolFromCreateTx, readU64, parseNameSymbolUri, collectInstructions } from "./shared";
 
 /** LetsBonk PlatformConfig account — the on-chain fingerprint used to distinguish
  *  LetsBonk txs from generic Raydium LaunchLab txs. */
@@ -19,6 +19,7 @@ export const LETSBONK_CONFIG_ACCOUNT = "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4
 
 const LAUNCHLAB_PROGRAM_ID   = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 const GRADUATION_TARGET_LAMPORTS = 100_000_000_000n; // 100 SOL
+const MAX_SOL_RESERVE = 10_000n * 1_000_000_000n; // guard SOL-only; token reserves can legitimately hit 10^15
 
 export const LetsBonkParser: LaunchpadParser = {
   id:             "letsbonk",
@@ -51,11 +52,18 @@ export const LetsBonkParser: LaunchpadParser = {
       const result = parseNameSymbolUri(d, 9) ?? parseNameSymbolUri(d, 1);
       if (result) return result;
     }
-    return extractMetadataFromTx(logs, message, meta);
+    return extractMetadataFromTx(logs, message, meta, LAUNCHLAB_PROGRAM_ID);
   },
 
-  deriveCurvePDA(mint) {
-    // LaunchLab uses "launch-pool" seed with the LaunchLab program (not the config account)
+  deriveCurvePDA(mint, message?, meta?) {
+    // Primary: extract pool account from InitializeV2 instruction accounts.
+    if (message && meta) {
+      // Same Raydium LaunchLab InitializeV2 layout as LaunchLab — pool PDA at index 5.
+      const extracted = extractPoolFromCreateTx(LAUNCHLAB_PROGRAM_ID, mint, "LetsBonk", 5, message, meta);
+      if (extracted) return extracted;
+    }
+
+    // Seed fallback (used for REST refreshes or if tx extraction fails)
     try {
       const [pda] = PublicKey.findProgramAddressSync(
         [Buffer.from("launch-pool"), new PublicKey(mint).toBuffer()],
@@ -66,18 +74,19 @@ export const LetsBonkParser: LaunchpadParser = {
   },
 
   parseCurveData(data): CurveState | null {
-    // LaunchLab layout — virtualSolReserves is at offset 24, NOT 16
-    // virtualTokenReserves u64 @8
-    // (gap / other field)  u64 @16
-    // virtualSolReserves   u64 @24   ← shifted
-    // realSolReserves      u64 @32   (if data.length >= 40)
-    if (data.length < 32) return null;
-    const virtualTokenReserves = readU64(data, 8);
-    const virtualSolReserves   = readU64(data, 24);
-    const realTokenReserves    = 0n;
-    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0n;
-    const curvePercentage      = Math.min(100, Number(virtualSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
-    const complete             = curvePercentage >= 100;
+    // Same VirtualPool layout as LaunchLab — LetsBonk uses the same Raydium LaunchLab program.
+    // See launchlab.ts for full field-offset reference.
+    if (data.length < 77) return null;
+    const virtualTokenReserves = readU64(data, 37);
+    const virtualSolReserves   = readU64(data, 45);
+    const realTokenReserves    = readU64(data, 53);
+    const realSolReserves      = readU64(data, 61);
+    const totalFundRaisingB    = readU64(data, 69);
+    if (virtualSolReserves === 0n || virtualTokenReserves === 0n) return null;
+    if (virtualSolReserves > MAX_SOL_RESERVE) return null;
+    const complete        = data[17] !== 0;
+    const denominator     = totalFundRaisingB > 0n ? totalFundRaisingB : GRADUATION_TARGET_LAMPORTS;
+    const curvePercentage = Math.min(100, Number(realSolReserves * 100n / denominator));
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };
   },
 };

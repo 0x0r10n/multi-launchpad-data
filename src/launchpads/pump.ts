@@ -2,7 +2,7 @@
 
 import { PublicKey } from "@solana/web3.js";
 import { LaunchpadParser, CurveState } from "./types";
-import { collectInstructions, extractMetadataFromTx, readU64 } from "./shared";
+import { collectInstructions, extractMetadataFromTx, parseNameSymbolUri, readU64 } from "./shared";
 
 const PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
@@ -10,7 +10,10 @@ const PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 // Stable across Pump.fun deployments — prefer over log string.
 const CREATE_DISC = "181ec828051c0777";
 
-const GRADUATION_TARGET_LAMPORTS = 85n * 1_000_000_000n; // 85 SOL in lamports
+const GRADUATION_TARGET_LAMPORTS  = 85n * 1_000_000_000n; // 85 SOL in lamports
+// Token reserves are in raw units (supply × 10^decimals) — up to 10^15 for 1B/6-decimal tokens.
+// Only guard SOL reserves: any real curve has < 1000 SOL; pubkey bytes produce ~10^18.
+const MAX_SOL_RESERVE = 10_000n * 1_000_000_000n; // 10,000 SOL in lamports
 
 export const PumpParser: LaunchpadParser = {
   id:             "pump",
@@ -37,10 +40,24 @@ export const PumpParser: LaunchpadParser = {
   },
 
   parseMetadata(logs, message, meta) {
-    return extractMetadataFromTx(logs, message, meta);
+    // Context-fenced: only reads "Program data:" logs within the Pump.fun invoke span.
+    // Also falls back to discriminator-matched instruction data as a secondary path.
+    const fromLogs = extractMetadataFromTx(logs, message, meta, PROGRAM_ID);
+    if (fromLogs.name) return fromLogs;
+    // Instruction fallback: only the create instruction (discriminator-matched)
+    for (const ix of collectInstructions(message, meta)) {
+      const d = Buffer.from(ix.data || []);
+      if (d.length >= 8 && d.slice(0, 8).toString("hex") === CREATE_DISC) {
+        const result = parseNameSymbolUri(d, 8);
+        if (result) return result;
+      }
+    }
+    return { name: "", symbol: "", uri: "" };
   },
 
-  deriveCurvePDA(mint) {
+  deriveCurvePDA(mint, _message?, _meta?) {
+    // Pump.fun bonding curve PDA is always deterministically derived from the mint.
+    // No tx extraction needed — the seed is canonical and never changes.
     try {
       const [pda] = PublicKey.findProgramAddressSync(
         [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
@@ -63,6 +80,8 @@ export const PumpParser: LaunchpadParser = {
     const virtualSolReserves   = readU64(data, 16);
     const realTokenReserves    = readU64(data, 24);
     const realSolReserves      = readU64(data, 32);
+    if (virtualSolReserves === 0n || virtualTokenReserves === 0n) return null;
+    if (virtualSolReserves > MAX_SOL_RESERVE) return null;
     const complete             = data[48] === 1;
     const curvePercentage      = Math.min(100, Number(realSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };

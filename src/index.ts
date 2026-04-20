@@ -1,4 +1,4 @@
-// src/index.ts — Full Payload Builder + /new endpoint + Live Broadcasting
+// src/index.ts — WebSocket broadcaster + /new endpoint + Live Broadcasting
 import express from "express";
 import { Server } from "socket.io";
 import { YellowstoneManager } from "./yellowstone-manager";
@@ -6,6 +6,8 @@ import { queueEnrichment, startEnrichmentSweep } from "./enricher";
 import { processCurveAccountUpdate, fetchAndDecodeCurve } from "./curve-tracker";
 import { startPriceTracker, getPriceHistory, recordPrice } from "./price-tracker";
 import { queueRiskAnalysis, queueInitialQuickRisk, startHolderSnapshot } from "./risk-analyzer";
+import { buildTokenPayload } from "./payload-builder";
+import { router as apiRouter } from "./routes/api";
 import Redis from "ioredis";
 import "dotenv/config";
 import cors from "cors";
@@ -13,6 +15,7 @@ import cors from "cors";
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use("/api", apiRouter);
 
 const server = app.listen(3000, () => console.log("→ API: http://localhost:3000"));
 const io = new Server(server, { cors: { origin: "*" } });
@@ -30,6 +33,9 @@ const pendingFirstCurve = new Map<string, (fields: Record<string, string> | null
 const richDelayBuffer: number[] = [];
 // Tracks how many rich broadcasts included top10 via the inline holder path.
 let top10InlineCount = 0;
+// Count of launches where all curve probes returned null/zero → rich broadcast was blocked.
+// Target: <0.5% of launches. Flushed every 5 minutes with other telemetry.
+let zeroPriceBlockedCount = 0;
 
 // Race two curve-data promises — first non-null result wins.
 // If both resolve null, returns null (skeleton stays until Geyser pushes later).
@@ -59,6 +65,20 @@ startEnrichmentSweep();
 io.on("connection", (socket) => {
   // Auto-join "new" room — client gets future new-launch events immediately
   socket.join("new");
+
+  // Send a snapshot of the latest 50 tokens immediately so the client has data
+  // without waiting for the next launch or having to call /new via REST.
+  redis.zrevrange("tokens:latest", 0, 49).then(async mints => {
+    if (!mints.length) return;
+    const pipeline = redis.pipeline();
+    for (const mint of mints) pipeline.hgetall(`token:${mint}`);
+    const results = await pipeline.exec();
+    const tokenDatas = results?.map(r => r?.[1] as Record<string, string> | null) ?? [];
+    const payloads = await Promise.all(
+      tokenDatas.filter(d => d?.mint).map(d => buildTokenPayload(d!))
+    );
+    socket.emit("snapshot", { type: "snapshot", room: "new", data: payloads });
+  }).catch(() => {});
 
   socket.on("leave", (room: string) => {
     socket.leave(room);
@@ -165,6 +185,14 @@ yellowstone.on("curve-update", async (event: any) => {
   if (fields?.complete === "true" && event.curvePDA) {
     yellowstone.removeCurvePDA(event.curvePDA);
   }
+
+  // Record price tick and push chart update AFTER Geyser confirms the post-trade price.
+  // Doing this here (not in the trade handler) ensures the tick always uses the real
+  // on-chain price, not the stale pre-trade value that was in Redis when the tx fired.
+  if (!event.isStartup && fields && parseFloat(fields.priceUsd || "0") > 0) {
+    recordPrice(event.mint).catch(() => {});
+    broadcastChartTick(event.mint).catch(() => {});
+  }
 });
 
 yellowstone.on("new-launch", async (data: any) => {
@@ -173,6 +201,8 @@ yellowstone.on("new-launch", async (data: any) => {
   // ── t=0 SYNC: Register Geyser listener before any await ─────────────────────
   // Must be synchronous so we never miss a Geyser snapshot that arrives
   // while we're awaiting the skeleton build or curve race below.
+  // 800ms window: Geyser account subscriptions take 400-800ms to propagate for
+  // brand-new accounts. The old 300ms window was too tight and caused 100% misses.
   const geyserFirstCurve: Promise<Record<string, string> | null> = data.curvePDA
     ? new Promise(resolve => {
         pendingFirstCurve.set(data.mint, resolve);
@@ -181,95 +211,136 @@ yellowstone.on("new-launch", async (data: any) => {
     : Promise.resolve(null);
 
   // ── t=0 ASYNC: Fire all parallel work immediately ────────────────────────────
-  // These three tasks start before the skeleton broadcast. By the time the curve
-  // race resolves (~100-400ms), the Redis reads are always done (~1ms each) and
-  // the holder fetch is often done too (~150-400ms RPC).
-  if (data.curvePDA) yellowstone.addCurvePDA(data.curvePDA, data.mint, platform);
+  // immediate=true: Geyser subscription goes out NOW, not after 20ms debounce
+  if (data.curvePDA) yellowstone.addCurvePDA(data.curvePDA, data.mint, platform, true);
 
+  // RPC probe with 800ms timeout — Chainstack confirmed commitment averages 400-600ms.
+  // The old 250ms timeout was causing near-100% timeouts.
   const rpcProbe = data.curvePDA
-    ? fetchAndDecodeCurve(data.mint, data.curvePDA, platform, 100)
+    ? fetchAndDecodeCurve(data.mint, data.curvePDA, platform, 800)
     : Promise.resolve(null);
 
-  // Holder snapshot: getTokenLargestAccounts (500ms internal timeout)
-  // Used for top10 concentration + ATA-derived dev% in the second broadcast.
+  // Holder snapshot: getTokenLargestAccounts (700ms internal timeout)
   let holderFields: { top10: string; devPercentage: string } | null = null;
   const holderPromise = data.curvePDA
     ? startHolderSnapshot(data.mint, data.creator || "", data.curvePDA, platform)
         .then(f => { holderFields = f; return f; })
     : Promise.resolve(null);
 
-  // Redis reads start immediately — both done in ~1ms, well before curve race resolves
+  // Redis reads start immediately — both done in ~1ms
   const sniperPromise  = redis.smembers(`snipers_set:${data.mint}`);
   const creatorPromise = data.creator
     ? redis.hgetall(`creator:${data.creator}`)
     : Promise.resolve({} as Record<string, string>);
 
-  // ── Skeleton broadcast (t≈5ms — after one Redis get for payload cache) ───────
+  // ── Skeleton broadcast (t≈5ms) ──────────────────────────────────────────────
   const skeletonPayload = await buildTokenPayload(data, false, []);
   broadcastNewToken(skeletonPayload);
   broadcastTokenUpdate(data.mint, skeletonPayload);
   console.log(`[BROADCAST] 🚀 ${data.name} ($${data.symbol}) | ${data.mint.slice(0, 12)}...`);
 
-  // ── Curve race: RPC probe (100ms) vs Geyser first snapshot (800ms safety) ────
+  // ── Fast curve race: RPC (800ms) vs Geyser (800ms) ──────────────────────────
+  let curveFields: Record<string, string> | null = null;
   if (data.curvePDA) {
-    const curveFields = await raceCurveData(rpcProbe, geyserFirstCurve);
+    curveFields = await raceCurveData(rpcProbe, geyserFirstCurve);
     pendingFirstCurve.delete(data.mint);
+  }
 
-    if (curveFields) {
-      Object.assign(data, curveFields);
+  // Validate using priceQuote (SOL-denominated) — computed directly from on-chain reserves,
+  // independent of SOL/USD oracle. More reliable than priceUsd for zero-check.
+  let curveValid = !!(curveFields && parseFloat(curveFields.priceQuote || "0") > 0);
 
-      // Redis reads are long done by now (~1ms each, started at t=0)
-      const [earlyBuyers, creatorHash] = await Promise.all([sniperPromise, creatorPromise]);
-
-      // Give holder snapshot up to 450ms extra after curve resolves.
-      // holderPromise started at t=0, so total budget = curve_race_time + 450ms.
-      // Internal timeout (480ms) is the binding constraint in all cases.
-      if (!holderFields) {
-        holderFields = await Promise.race([
-          holderPromise,
-          new Promise<null>(r => setTimeout(() => r(null), 450)),
-        ]);
+  // ── Blocking RPC fallback (2s) — only fires if fast race missed ─────────────
+  // This catches cases where Chainstack confirmed/processed takes >800ms.
+  if (!curveValid && data.curvePDA) {
+    console.log(`[BROADCAST] ⏳ Fast race missed for ${data.name} — trying 2s RPC fallback`);
+    // Try processed commitment first (faster)
+    const fallbackFields = await fetchAndDecodeCurve(data.mint, data.curvePDA, platform, 2000, "processed");
+    if (fallbackFields && parseFloat(fallbackFields.priceQuote || "0") > 0) {
+      curveFields = fallbackFields;
+      curveValid = true;
+    } else {
+      // IF THAT FAILS: try one last time with CONFIRMED commitment.
+      // Sometimes 'processed' is missing some accounts that 'confirmed' has (weird RPC behavior).
+      console.log(`[BROADCAST] ⚠️ 2s processed fallback missed for ${data.name} — final attempt with confirmed commitment`);
+      const finalFallback = await fetchAndDecodeCurve(data.mint, data.curvePDA, platform, 3000, "confirmed");
+      if (finalFallback && parseFloat(finalFallback.priceQuote || "0") > 0) {
+        curveFields = finalFallback;
+        curveValid = true;
       }
-
-      // Build one combined rich update: price + curve + dev context + top10 (if ready)
-      const richPayloadMs = Date.now() - parseInt(data.createdAt || "0");
-      richDelayBuffer.push(richPayloadMs);
-      if (holderFields) top10InlineCount++;
-      const richFields: Record<string, string> = {
-        snipersCount:  earlyBuyers.length.toString(),
-        devStats:      JSON.stringify({
-          total_launched: parseInt(creatorHash.launched || "0"),
-          total_migrated: parseInt(creatorHash.migrated || "0"),
-        }),
-        richPayloadMs: richPayloadMs.toString(), // telemetry: ms from launch to rich broadcast
-        ...(holderFields
-          ? {
-              top10:           holderFields.top10,
-              devPercentage:   holderFields.devPercentage,
-              riskQuickScanAt: Date.now().toString(), // marks quick scan done → t=2s skips
-            }
-          : {}),
-      };
-      Object.assign(data, richFields);
-
-      redis.hset(`token:${data.mint}`, { ...curveFields, ...richFields }).catch(() => {});
-      const richPayload = await buildTokenPayload(data, true, []);
-      broadcastNewToken(richPayload);
-      broadcastTokenUpdate(data.mint, richPayload);
-      console.log(
-        `[BROADCAST] 💰 ${data.name} | price=${parseFloat(data.priceUsd || "0").toFixed(8)}` +
-        ` | top10=${holderFields ? holderFields.top10 + "%" : "pending"}` +
-        ` | dev_launches=${creatorHash.launched || "0"} snipers=${earlyBuyers.length}`,
-      );
     }
-    // No curve data: Geyser will deliver eventually via the pubsub → broadcast path
+  }
+
+  // ── Wait for parallel risk reads (always started at t=0) ────────────────────
+  const [earlyBuyers, creatorHash] = await Promise.all([sniperPromise, creatorPromise]);
+
+  // Wait for holder snapshot when we have price (or even without — it's already running)
+  if (!holderFields) {
+    holderFields = await Promise.race([
+      holderPromise,
+      new Promise<null>(r => setTimeout(() => r(null), curveValid ? 450 : 100)),
+    ]);
+  }
+
+  const richPayloadMs = Date.now() - parseInt(data.createdAt || "0");
+  richDelayBuffer.push(richPayloadMs);
+  if (holderFields) top10InlineCount++;
+
+  const richFields: Record<string, string> = {
+    snipersCount: earlyBuyers.length.toString(),
+    devStats:     JSON.stringify({
+      total_launched: parseInt(creatorHash.launched || "0"),
+      total_migrated: parseInt(creatorHash.migrated || "0"),
+    }),
+    richPayloadMs: richPayloadMs.toString(),
+    ...(holderFields
+      ? {
+          top10:           holderFields.top10,
+          devPercentage:   holderFields.devPercentage,
+          riskQuickScanAt: Date.now().toString(),
+        }
+      : {}),
+  };
+
+  // ── CRITICAL: Never broadcast a "rich" payload with zero price ──────────────
+  // If curve data is still missing after all probes, persist only risk data to
+  // Redis (silent write) and do NOT broadcast a second payload. The Geyser
+  // pubsub handler (processCurveAccountUpdate → token-updates → subscriber)
+  // will trigger a full rich broadcast when the real curve data arrives.
+  if (!curveValid) {
+    zeroPriceBlockedCount++;
+    // Persist risk fields silently — no broadcast with zeros
+    redis.hset(`token:${data.mint}`, richFields).catch(() => {});
+    console.log(
+      `[BROADCAST] ⏸️ ${data.name} | price pending (skeleton live)` +
+      ` | top10=${holderFields ? holderFields.top10 + "%" : "pending"}` +
+      ` | dev=${creatorHash.launched || "0"} snipers=${earlyBuyers.length}` +
+      ` | t=${richPayloadMs}ms — waiting for Geyser`,
+    );
+  } else {
+    // Rich broadcast — real price, liquidity, mcap all non-zero
+    const broadcastFields = { ...curveFields!, ...richFields };
+    Object.assign(data, broadcastFields);
+    redis.hset(`token:${data.mint}`, broadcastFields).catch(() => {});
+    await redis.del(`payload:${data.mint}`);
+    const secondPayload = await buildTokenPayload(data, true, []);
+    broadcastNewToken(secondPayload);
+    broadcastTokenUpdate(data.mint, secondPayload);
+    console.log(
+      `[BROADCAST] 💰 ${data.name}` +
+      ` | price=${parseFloat(data.priceUsd || "0").toFixed(8)}` +
+      ` | mcap=$${parseFloat(data.marketCapUsd || "0").toFixed(0)}` +
+      ` | curve=${parseFloat(data.curvePercentage || "0").toFixed(1)}%` +
+      ` | top10=${holderFields ? holderFields.top10 + "%" : "pending"}` +
+      ` | dev=${creatorHash.launched || "0"} snipers=${earlyBuyers.length}` +
+      ` | t=${richPayloadMs}ms`,
+    );
   }
 
   // ── Background enrichment (IPFS/Arweave — non-blocking) ─────────────────────
   queueEnrichment(data.mint);
 
   // ── t=2s fallback: only runs if riskQuickScanAt not yet set ──────────────────
-  // Covers: holderPromise timed out, or curveFields never arrived above.
   setTimeout(() => queueInitialQuickRisk(data.mint), 2_000);
 
   // ── t=15s: full risk — owner resolution, insider detection ───────────────────
@@ -277,17 +348,18 @@ yellowstone.on("new-launch", async (data: any) => {
 });
 
 yellowstone.on("trade", async (data: any) => {
-  // We don't build full payload here to save RPC/Redis usage
-  // Just emit the trade event to the specific token room
+  // Emit the raw trade event immediately — client uses this to update buy/sell counters
+  // and trade list without waiting for the next curve-update broadcast.
   io.to(`token:${data.mint}`).emit("trade", {
-    mint: data.mint, signature: data.signature,
-    type: data.type, solAmount: data.solAmount
+    mint: data.mint,
+    signature: data.signature,
+    type: data.type,
+    solAmount: data.solAmount,
+    maker: data.maker,
   });
-  
-  // Curve data is pushed by Geyser when the curve account changes — no RPC call needed.
-  // Just record the price tick (reads cached priceQuote from Redis, no RPC).
-  recordPrice(data.mint);
-  broadcastChartTick(data.mint);
+
+  // recordPrice + broadcastChartTick are called in the curve-update handler after Geyser
+  // confirms the post-trade price — guarantees chart ticks always use the real on-chain value.
 
   try {
     if (data.type === "buy" && data.maker && data.slot != null) {
@@ -375,10 +447,15 @@ setInterval(() => {
   if (n === 0) return;
   const sorted = [...richDelayBuffer].sort((a, b) => a - b);
   const p = (pct: number) => sorted[Math.min(Math.floor(n * pct), n - 1)];
-  const top10Pct = ((top10InlineCount / n) * 100).toFixed(1);
-  console.log(`[Telemetry] richPayloadDelay | n=${n} p50=${p(0.50)}ms p95=${p(0.95)}ms p99=${p(0.99)}ms | top10Inline=${top10Pct}%`);
+  const top10Pct      = ((top10InlineCount / n) * 100).toFixed(1);
+  const blockedPct    = ((zeroPriceBlockedCount / n) * 100).toFixed(1);
+  console.log(
+    `[Telemetry] richPayloadDelay | n=${n} p50=${p(0.50)}ms p95=${p(0.95)}ms p99=${p(0.99)}ms` +
+    ` | top10Inline=${top10Pct}% zeroPriceBlocked=${zeroPriceBlockedCount} (${blockedPct}%)`,
+  );
   richDelayBuffer.length = 0;
   top10InlineCount = 0;
+  zeroPriceBlockedCount = 0;
 }, 5 * 60_000);
 
 // ========== TRENDING JOB ==========
@@ -496,42 +573,6 @@ app.get("/new", async (_req, res) => {
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
-});
-
-// GET /api/token/:mint — single token full payload with price history
-app.get("/api/token/:mint", async (req, res) => {
-  try {
-    const d = await redis.hgetall(`token:${req.params.mint}`);
-    if (!d || Object.keys(d).length === 0) {
-      return res.status(404).json({ error: "Token not found" });
-    }
-    const payload = await buildTokenPayload(d, true);
-    res.json(payload);
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/token/:mint/history — price history for charts
-app.get("/api/token/:mint/history", async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit as string) || 200;
-    const history = await getPriceHistory(req.params.mint, limit);
-    res.json({ mint: req.params.mint, count: history.length, history });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/stats — live stream statistics
-app.get("/api/stats", async (_req, res) => {
-  const tokenCount = await redis.zcard("tokens:latest");
-  res.json({
-    status: "running",
-    tokensInRedis: tokenCount,
-    uptime: process.uptime().toFixed(0) + "s",
-    timestamp: new Date().toISOString(),
-  });
 });
 
 // GET /doc — full integration reference in JSON
@@ -1057,165 +1098,6 @@ function leaveRoom(room) {
 
 
 
-// ========== PAYLOAD BUILDER ==========
-
-// Short-lived payload cache (2s TTL) — avoids rebuilding on rapid successive pubsub messages.
-// The pubsub handler busts this before calling buildTokenPayload, so workers always get fresh data.
-// REST endpoints always bypass the cache by passing forceRebuild=true.
-async function buildTokenPayload(
-  d: Record<string, string>,
-  forceRebuild = false,
-  priceHistoryOverride?: any[],
-): Promise<any> {
-  const mint = d.mint || "";
-
-  if (!forceRebuild && mint) {
-    const cached = await redis.get(`payload:${mint}`);
-    if (cached) return JSON.parse(cached);
-  }
-
-  const createdAt = parseInt(d.createdAt || Date.now().toString());
-  const platform = d.platform || "pump";
-
-  // Use provided history (e.g. [] for new tokens) or fetch from Redis
-  const priceHistory = priceHistoryOverride !== undefined
-    ? priceHistoryOverride
-    : (mint ? await getPriceHistory(mint, 50) : []);
-
-  const payload = {
-    type: "message",
-    room: "new",
-    data: {
-      token: {
-        name: d.name || "Unknown Token",
-        symbol: d.symbol || "???",
-        mint,
-        uri: d.uri || "",
-        decimals: parseInt(d.decimals || "6"),
-        description: d.description || "",
-        image: d.image || "",
-        hasFileMetaData: !!(d.uri),
-        isMayhemMode: d.isMayhemMode === "true",
-        isCashbackEnabled: d.isCashbackEnabled === "true",
-        createdOn: platform === "moon" ? "https://moon.it" : platform === "bags" ? "https://bags.fm" : platform === "letsbonk" ? "https://letsbonk.fun" : platform === "launchlab" ? "https://raydium.io/launchlab" : "https://pump.fun",
-        strictSocials: {
-          twitter: d.twitter || "",
-          telegram: d.telegram || "",
-          website: d.website || ""
-        },
-        creation: {
-          creator: d.creator || "",
-          created_tx: d.createdTx || "",
-          created_time: Math.floor(createdAt / 1000)
-        }
-      },
-      pools: [{
-        poolId: d.curvePDA || "",
-        liquidity: {
-          quote: parseFloat(d.liquidity || "0"),
-          usd: parseFloat(d.liquidityUsd || "0")
-        },
-        price: {
-          quote: parseFloat(d.priceQuote || "0"),
-          usd: parseFloat(d.priceUsd || "0")
-        },
-        tokenSupply: 1000000000000000,
-        lpBurn: 100,
-        tokenAddress: mint,
-        marketCap: {
-          quote: parseFloat(d.marketCapQuote || "0"),
-          usd: parseFloat(d.marketCapUsd || "0")
-        },
-        decimals: parseInt(d.decimals || "6"),
-        security: {
-          freezeAuthority: null,
-          mintAuthority: null
-        },
-        quoteToken: "So11111111111111111111111111111111111111112",
-        market: platform === "pump" ? "pumpfun" : platform,
-        deployer: d.creator || "",
-        lastUpdated: Date.now(),
-        createdAt: createdAt,
-        txns: {
-          buys: parseInt(d.buys || "0"),
-          sells: parseInt(d.sells || "0"),
-          total: parseInt(d.totalTxns || "0"),
-          volume: parseFloat(d.volumeUsd || "0"),
-          volume24h: parseFloat(d.volume24hUsd || "0")
-        },
-        curvePercentage: parseFloat(d.curvePercentage || "0"),
-        creation: {
-          creator: d.creator || "",
-          created_tx: d.createdTx || "",
-          created_time: createdAt
-        }
-      }],
-      events: {
-        "1m": { priceChangePercentage: parseFloat(d["1m"] || "0") },
-        "5m": { priceChangePercentage: parseFloat(d["5m"] || "0") },
-        "15m": { priceChangePercentage: parseFloat(d["15m"] || "0") },
-        "30m": { priceChangePercentage: parseFloat(d["30m"] || "0") },
-        "1h": { priceChangePercentage: parseFloat(d["1h"] || "0") },
-        "4h": { priceChangePercentage: parseFloat(d["4h"] || "0") },
-        "24h": { priceChangePercentage: parseFloat(d["24h"] || "0") }
-      },
-      risk: {
-        snipers: {
-          count: parseInt(d.snipersCount || "0"),
-          totalBalance: parseFloat(d.snipersTotalBal || "0"),
-          totalPercentage: parseFloat(d.snipersTotalPct || "0"),
-          wallets: safeParse(d.snipers, [])
-        },
-        insiders: {
-          count: parseInt(d.insidersCount || "0"),
-          totalBalance: parseFloat(d.insidersTotalBal || "0"),
-          totalPercentage: parseFloat(d.insidersTotalPct || "0"),
-          wallets: safeParse(d.insiders, [])
-        },
-        top10: parseFloat(d.top10 || "0"),
-        dev: {
-          percentage: parseFloat(d.devPercentage || "0"),
-          amount: parseFloat(d.devAmount || "0"),
-          stats: safeParse(d.devStats, { total_launched: 0, total_migrated: 0 })
-        }
-      },
-      graduation: {
-        status: d.graduationStatus || (parseFloat(d.curvePercentage || "0") >= 80 ? "graduating" : "new")
-      },
-      dev_stats: safeParse(d.devStats, { total_launched: 0, total_migrated: 0 }),
-      priceHistory,
-      meta: {
-        // Completeness flags — frontend uses for progressive loading states.
-        // hasPrice:      price/liquidity populated (~100-400ms after launch)
-        // hasBasicRisk:  dev history + sniper count in same broadcast as price
-        // hasTop10:      top10 concentration + ATA dev% computed (inline or t=2s fallback)
-        // hasRisk:       full quick scan complete (superset of hasTop10)
-        // hasImage:      IPFS/Arweave metadata resolved (~500ms–3s)
-        // expectedRichBy: unix ms by which rich payload (hasPrice+hasTop10) should have arrived.
-        //                 Anchored to createdAt so it stays meaningful on re-fetches and REST calls.
-        //                 Frontend: if Date.now() > expectedRichBy && !hasPrice → show "data delayed".
-        hasPrice:        parseFloat(d.priceUsd || "0") > 0,
-        hasBasicRisk:    !!d.devStats,
-        hasTop10:        "top10" in d,
-        hasRisk:         !!(d.riskQuickScanAt || d.riskAnalyzedAt),
-        hasImage:        !!(d.image && d.image !== ""),
-        expectedRichBy:  parseInt(d.createdAt || "0") + 450,
-        richPayloadDelay: d.richPayloadMs ? parseInt(d.richPayloadMs) : null,
-      }
-    }
-  };
-
-  // Cache for 10 seconds — busted by the pubsub handler before each worker update.
-  // Longer TTL helps trending calc and repeated WebSocket snapshot requests.
-  if (mint) await redis.setex(`payload:${mint}`, 10, JSON.stringify(payload));
-  return payload;
-}
-
-function safeParse(json: string | undefined, fallback: any): any {
-  if (!json) return fallback;
-  try { return JSON.parse(json); } catch { return fallback; }
-}
-
 // ── Global error safety net ───────────────────────────────────────────────────
 // Node.js v15+ crashes on unhandled promise rejections by default.
 // Geyser h2 transport resets (INTERNAL_ERROR from Chainstack) can leak past the
@@ -1225,9 +1107,9 @@ process.on("unhandledRejection", (reason: any) => {
   console.error("[Process] Unhandled rejection:", reason?.message || reason);
   // If it looks like a Geyser transport error, trigger a reconnect
   const msg = String(reason?.message || reason || "");
-  if (msg.includes("h2 protocol") || msg.includes("transport error") || msg.includes("gRPC")) {
+  if (msg.includes("h2 protocol") || msg.includes("transport error") || msg.includes("gRPC") || msg.includes("exhausted")) {
     console.error("[Process] Geyser transport error — triggering reconnect via manager");
-    yellowstone.start().catch(() => {});
+    yellowstone.reconnect(); // reconnect() tears down old streams first, unlike start()
   }
 });
 

@@ -30,6 +30,10 @@ async function enrichToken(mint: string) {
 
   if (existing.image && existing.image !== "") return;
 
+  // Skip if we already attempted enrichment and it completed (even with no image found).
+  // Prevents re-queuing tokens with legitimately absent metadata on every 15s sweep.
+  if (existing.enrichedAt) return;
+
   // === ON-CHAIN: Get URI ===
   let uri = existing.uri || "";
 
@@ -56,13 +60,21 @@ async function enrichToken(mint: string) {
     }
   }
 
-  if (!uri) return;
+  if (!uri) {
+    // No URI available even after on-chain lookup — mark as attempted so sweep skips it.
+    await redis.hset(`token:${mint}`, { enrichedAt: Date.now().toString() });
+    return;
+  }
 
   // === OFF-CHAIN: Fetch JSON from token URI (IPFS/HTTP) ===
   const metadata = await fetchOffChainMetadata(uri);
-  if (!metadata) return;
+  if (!metadata) {
+    // URI exists but fetch failed (IPFS down, 4xx, etc.) — don't stamp enrichedAt so
+    // the sweep retries it. Only stamp once we actually get a response (success or empty).
+    return;
+  }
 
-  const update: Record<string, string> = {};
+  const update: Record<string, string> = { enrichedAt: Date.now().toString() };
 
   if (metadata.image)       update.image       = resolveIpfsUrl(metadata.image);
   if (metadata.description) update.description = metadata.description;
@@ -82,8 +94,8 @@ async function enrichToken(mint: string) {
     if (links.website)  update.website  = links.website;
   }
 
-  if (Object.keys(update).length > 0) {
-    await redis.hset(`token:${mint}`, update);
+  await redis.hset(`token:${mint}`, update);
+  if (Object.keys(update).length > 1) { // > 1 because enrichedAt is always present
     const hasSocials = !!(update.twitter || update.telegram || update.website);
     console.log(`[Enricher] ✅ ${existing.name} ($${existing.symbol}) | image=${!!update.image} desc=${!!update.description} socials=${hasSocials}`);
     await redis.publish("token-updates", mint);
@@ -98,11 +110,15 @@ export function startEnrichmentSweep() {
       let retried = 0;
       // Pipeline all 50 hmget calls into a single round-trip
       const pipeline = redis.pipeline();
-      for (const mint of mints) pipeline.hmget(`token:${mint}`, "image", "name", "symbol");
+      for (const mint of mints) pipeline.hmget(`token:${mint}`, "image", "name", "symbol", "enrichedAt");
       const results = await pipeline.exec();
       for (let i = 0; i < mints.length; i++) {
-        const [image, name, symbol] = (results?.[i]?.[1] as string[] | null) ?? [];
-        if (!image || image === "" || !name || name === "" || name === "Unknown Token" || !symbol || symbol === "" || symbol === "???") {
+        const [image, name, symbol, enrichedAt] = (results?.[i]?.[1] as string[] | null) ?? [];
+        // Skip tokens already enriched — enrichedAt is stamped on every completed attempt
+        if (enrichedAt) continue;
+        // Skip tokens with no identity yet (tx metadata not parsed, enricher will be called once identity arrives)
+        if (!name || name === "Unknown Token" || !symbol || symbol === "???") continue;
+        if (!image || image === "") {
           enrichToken(mints[i]).catch(() => {});
           retried++;
         }

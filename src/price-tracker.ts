@@ -114,6 +114,6 @@ export function startPriceTracker() {
     }
   }, 30_000);
 
-  console.log("[PriceTracker] Started — snapshots every 30s for top 50 tokens");
+  console.log("[PriceTracker] Started — snapshots every 30s for top 200 active tokens");
 }
 

@@ -1,12 +1,13 @@
 // src/launchpads/launchlab.ts — Raydium LaunchLab parser
 
 import { PublicKey } from "@solana/web3.js";
-import { LaunchpadParser, CurveState } from "./types";
-import { extractMetadataFromTx, detectSwapFromDelta, readU64, parseNameSymbolUri, collectInstructions } from "./shared";
+import { LaunchpadParser } from "./types";
+import { extractMetadataFromTx, detectSwapFromDelta, extractPoolFromCreateTx, readU64, parseNameSymbolUri, collectInstructions } from "./shared";
 
 export const LAUNCHLAB_PROGRAM_ID = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 const PROGRAM_ID = LAUNCHLAB_PROGRAM_ID;
 const GRADUATION_TARGET_LAMPORTS = 100_000_000_000n; // 100 SOL
+const MAX_SOL_RESERVE = 10_000n * 1_000_000_000n; // guard SOL-only; token reserves can legitimately hit 10^15
 
 export const LaunchLabParser: LaunchpadParser = {
   id:             "launchlab",
@@ -37,12 +38,20 @@ export const LaunchLabParser: LaunchpadParser = {
       const result = parseNameSymbolUri(d, 9) ?? parseNameSymbolUri(d, 1);
       if (result) return result;
     }
-    return extractMetadataFromTx(logs, message, meta);
+    return extractMetadataFromTx(logs, message, meta, PROGRAM_ID);
   },
 
-  deriveCurvePDA(mint) {
+  deriveCurvePDA(mint, message?, meta?) {
+    // Primary: extract pool account from InitializeV2 instruction accounts.
+    if (message && meta) {
+      // LaunchLab InitializeV2 account layout (verified from on-chain tx):
+      //   [0] payer  [1] creator  [2] globalConfig  [3] platformConfig  [4] authority  [5] poolState  [6] baseMint ...
+      const extracted = extractPoolFromCreateTx(PROGRAM_ID, mint, "LaunchLab", 5, message, meta);
+      if (extracted) return extracted;
+    }
+
+    // Seed fallback (used for REST refreshes or if tx extraction fails)
     try {
-      // LaunchLab uses "launch-pool" — different from every other platform's "bonding-curve"
       const [pda] = PublicKey.findProgramAddressSync(
         [Buffer.from("launch-pool"), new PublicKey(mint).toBuffer()],
         new PublicKey(PROGRAM_ID),
@@ -52,19 +61,30 @@ export const LaunchLabParser: LaunchpadParser = {
   },
 
   parseCurveData(data) {
-    // Raydium LaunchLab layout — virtualSolReserves is at offset 24, NOT 16
-    // This is a known difference from all other platforms.
-    // virtualTokenReserves u64 @8
-    // (gap / other field)  u64 @16
-    // virtualSolReserves   u64 @24   ← shifted
-    // realSolReserves      u64 @32   (if data.length >= 40)
-    if (data.length < 32) return null;
-    const virtualTokenReserves = readU64(data, 8);
-    const virtualSolReserves   = readU64(data, 24);
-    const realTokenReserves    = 0n;
-    const realSolReserves      = data.length >= 40 ? readU64(data, 32) : 0n;
-    const curvePercentage      = Math.min(100, Number(virtualSolReserves * 100n / GRADUATION_TARGET_LAMPORTS));
-    const complete             = curvePercentage >= 100;
+    // Raydium LaunchLab VirtualPool account layout (Borsh-packed, from SDK layout.ts):
+    // [0:8]   discriminator (unnamed u64)
+    // [8:16]  epoch (u64)
+    // [16]    bump (u8)
+    // [17]    status (u8) — 0=active, non-zero=migrated
+    // [18]    mintDecimalsA, [19] mintDecimalsB, [20] migrateType
+    // [21:29] supply (u64)
+    // [29:37] totalSellA (u64)
+    // [37:45] virtualA (u64) ← virtualTokenReserves
+    // [45:53] virtualB (u64) ← virtualSolReserves
+    // [53:61] realA (u64)    ← realTokenReserves
+    // [61:69] realB (u64)    ← realSolReserves
+    // [69:77] totalFundRaisingB (u64) ← graduation target in lamports
+    if (data.length < 77) return null;
+    const virtualTokenReserves = readU64(data, 37);
+    const virtualSolReserves   = readU64(data, 45);
+    const realTokenReserves    = readU64(data, 53);
+    const realSolReserves      = readU64(data, 61);
+    const totalFundRaisingB    = readU64(data, 69);
+    if (virtualSolReserves === 0n || virtualTokenReserves === 0n) return null;
+    if (virtualSolReserves > MAX_SOL_RESERVE) return null;
+    const complete        = data[17] !== 0;
+    const denominator     = totalFundRaisingB > 0n ? totalFundRaisingB : GRADUATION_TARGET_LAMPORTS;
+    const curvePercentage = Math.min(100, Number(realSolReserves * 100n / denominator));
     return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete, curvePercentage };
   },
 };

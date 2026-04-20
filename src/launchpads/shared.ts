@@ -1,5 +1,6 @@
 // src/launchpads/shared.ts — Utilities shared across all launchpad parsers
 
+import bs58 from "bs58";
 import { TokenMetadata } from "./types";
 
 // ── Instruction collection ────────────────────────────────────────────────────
@@ -14,6 +15,83 @@ export function collectInstructions(message: any, meta: any): any[] {
     }
   }
   return all;
+}
+
+/**
+ * Extract the pool/curve PDA from a create transaction.
+ *
+ * Strategy (in order of preference):
+ *   1. Top-level instructions first — inner CPIs have different account layouts.
+ *   2. The instruction must reference `programId` AND include `mint` as one of its
+ *      accounts — this uniquely identifies the create instruction even when the same
+ *      program appears in multiple inner instructions.
+ *   3. Return the account at `preferredIndex` within that instruction's account list.
+ *   4. Fall back to inner instructions with the same filter.
+ *
+ * Logs all accounts so callers can verify the correct index from live output.
+ * Returns "" on failure — caller must fall back to seed derivation.
+ */
+export function extractPoolFromCreateTx(
+  programId: string,
+  mint: string,
+  label: string,
+  preferredIndex: number = 3,
+  message: any,
+  meta: any,
+  debugAccounts: boolean = false
+): string {
+  if (!message) return "";
+
+  const rawKeys: Uint8Array[] = message?.accountKeys || [];
+  const loadedWritable: Uint8Array[] = meta?.loadedWritableAddresses || [];
+  const loadedReadonly: Uint8Array[] = meta?.loadedReadonlyAddresses || [];
+  const accountKeys = [...rawKeys, ...loadedWritable, ...loadedReadonly].map((k: any) => bs58.encode(k));
+
+  // First pass: top-level instructions (most reliable for create)
+  const topLevel: any[] = message?.instructions || [];
+  for (const ix of topLevel) {
+    if (accountKeys[ix.programIdIndex] !== programId) continue;
+    const accs = Array.from((ix.accounts as Uint8Array) || []);
+    if (accs.some(i => accountKeys[i] === mint)) {
+      const accounts = accs.map(i => accountKeys[i]);
+      if (debugAccounts) {
+        console.log(`[Extract ${label}] accounts dump for mint=${mint.slice(0, 12)}:`);
+        accounts.forEach((a, i) => console.log(`  [${i}] ${a}`));
+      }
+      const candidate = accounts[preferredIndex];
+      if (candidate && candidate.length > 40) {
+        console.log(`[Extract ${label}] SUCCESS — poolPDA from top-level ix, index=${preferredIndex} → ${candidate.slice(0, 12)}`);
+        return candidate;
+      }
+      console.warn(`[Extract ${label}] index=${preferredIndex} empty/missing — accounts.length=${accounts.length}`);
+    }
+  }
+
+  // Second pass: inner instructions (for complex CPIs)
+  const innerGroups: any[] = meta?.innerInstructions || [];
+  for (const group of innerGroups) {
+    for (const ix of (group.instructions || [])) {
+      const pid = ix.programIdIndex != null ? accountKeys[ix.programIdIndex] : (ix.programId ? bs58.encode(ix.programId) : "");
+      if (pid !== programId) continue;
+
+      const accs = Array.from((ix.accounts as Uint8Array) || []);
+      if (accs.some(i => accountKeys[i] === mint)) {
+        const accounts = accs.map(i => accountKeys[i]);
+        if (debugAccounts) {
+          console.log(`[Extract ${label}] inner accounts dump for mint=${mint.slice(0, 12)}:`);
+          accounts.forEach((a, i) => console.log(`  [${i}] ${a}`));
+        }
+        const candidate = accounts[preferredIndex];
+        if (candidate && candidate.length > 40) {
+          console.log(`[Extract ${label}] SUCCESS — poolPDA from inner ix, index=${preferredIndex} → ${candidate.slice(0, 12)}`);
+          return candidate;
+        }
+      }
+    }
+  }
+
+  console.warn(`[Extract ${label}] FAILED to find pool PDA — mint=${mint.slice(0, 12)}`);
+  return "";
 }
 
 // ── Metadata parsing ──────────────────────────────────────────────────────────
@@ -68,17 +146,48 @@ export function parseFromBase64(b64: string): TokenMetadata | null {
  * Universal metadata extraction strategy used by all parsers:
  * 1. "Program data:" base64 log entries  (Anchor event — most structured)
  * 2. Raw instruction data scan           (Borsh-encoded instruction args)
+ *
+ * When `programId` is supplied the log scan is fenced to entries emitted inside that
+ * program's execution context. This prevents Jito tip and other bundled programs from
+ * having their fee/config placeholder strings accidentally parsed as token name/symbol.
+ *
  * Returns empty strings when nothing is found — enricher handles the rest.
  */
-export function extractMetadataFromTx(logs: string[], message: any, meta: any): TokenMetadata {
-  for (const log of logs) {
-    if (!log.startsWith("Program data: ")) continue;
-    const result = parseFromBase64(log.slice("Program data: ".length));
-    if (result) return result;
-  }
-  for (const ix of collectInstructions(message, meta)) {
-    const result = parseNameSymbolUri(Buffer.from(ix.data || []));
-    if (result) return result;
+export function extractMetadataFromTx(logs: string[], message: any, meta: any, programId?: string): TokenMetadata {
+  if (programId) {
+    // Context-fenced scan — only read "Program data:" within this program's invoke/success span
+    let inCtx = false;
+    for (const log of logs) {
+      if (log.includes(`Program ${programId} invoke`)) { inCtx = true; continue; }
+      if (log.includes(`Program ${programId} success`) || log.includes(`Program ${programId} failed`)) { inCtx = false; continue; }
+      if (inCtx && log.startsWith("Program data: ")) {
+        const result = parseFromBase64(log.slice("Program data: ".length));
+        if (result) return result;
+      }
+    }
+
+    // Instruction fallback — only scan instructions belonging to the target program.
+    // Scanning all instructions risks matching fee/config structs from Jito or other CPIs.
+    const rawKeys: Uint8Array[] = message?.accountKeys || [];
+    const loadedWritable: Uint8Array[] = meta?.loadedWritableAddresses || [];
+    const loadedReadonly: Uint8Array[] = meta?.loadedReadonlyAddresses || [];
+    const accountKeys = [...rawKeys, ...loadedWritable, ...loadedReadonly].map((k: any) => bs58.encode(k));
+    for (const ix of collectInstructions(message, meta)) {
+      const pid = ix.programIdIndex != null ? accountKeys[ix.programIdIndex] : "";
+      if (pid !== programId) continue;
+      const result = parseNameSymbolUri(Buffer.from(ix.data || []));
+      if (result) return result;
+    }
+  } else {
+    for (const log of logs) {
+      if (!log.startsWith("Program data: ")) continue;
+      const result = parseFromBase64(log.slice("Program data: ".length));
+      if (result) return result;
+    }
+    for (const ix of collectInstructions(message, meta)) {
+      const result = parseNameSymbolUri(Buffer.from(ix.data || []));
+      if (result) return result;
+    }
   }
   return { name: "", symbol: "", uri: "" };
 }

@@ -37,30 +37,75 @@ async function computeHolderFields(
   timeoutMs: number,
 ): Promise<{ top10: string; devPercentage: string } | null> {
   const mintPubkey = new PublicKey(mint);
-  const excludeWallets = platform === "moon" ? MOON_EXCLUDE_WALLETS : [];
 
-  const result = await Promise.race([
+  // Owners to exclude from holder calculations.
+  // curvePDA is the bonding curve state account — its token vault is OWNED BY curvePDA,
+  // so filtering by owner (not address) is what actually removes it from the results.
+  const excludeOwners = new Set<string>(platform === "moon" ? MOON_EXCLUDE_WALLETS : []);
+  if (curvePDA) excludeOwners.add(curvePDA);
+
+  // Derive the curve's token vault address as a secondary (address-level) fallback filter.
+  // Covers the case where owner resolution fails or times out.
+  let curveVaultAddr = "";
+  try {
+    if (curvePDA) curveVaultAddr = getAssociatedTokenAddress(mintPubkey, new PublicKey(curvePDA)).toBase58();
+  } catch {}
+
+  const deadline = Date.now() + timeoutMs;
+
+  const largestResult = await Promise.race([
     connection.getTokenLargestAccounts(mintPubkey).catch(() => null),
     new Promise<null>(r => setTimeout(() => r(null), timeoutMs)),
   ]);
-  if (!result?.value?.length) return null;
+  if (!largestResult?.value?.length) return null;
 
-  const holders = result.value
-    .filter(h => {
-      const addr = h.address.toBase58();
-      return addr !== curvePDA && !excludeWallets.includes(addr);
-    })
+  const topAccounts = largestResult.value.slice(0, 15);
+
+  // Resolve the owner of each SPL token account — same approach as analyzeRisk.
+  // Without this, the bonding curve vault (which holds ~1B tokens at launch) is NOT
+  // excluded and top10 shows ~100%. The owner field (bytes 32-64 of the token account
+  // data) is the wallet/PDA that controls the account — for the curve vault, that is
+  // curvePDA, which we exclude above.
+  const remainingMs = Math.max(100, deadline - Date.now());
+  let accountInfos: (import("@solana/web3.js").AccountInfo<Buffer> | null)[] | null = null;
+  try {
+    accountInfos = await Promise.race([
+      connection.getMultipleAccountsInfo(topAccounts.map(h => h.address)),
+      new Promise<null>(r => setTimeout(() => r(null), remainingMs)),
+    ]);
+  } catch {}
+
+  // Without owner resolution we can't filter the curve vault (which holds ~1B tokens).
+  // Returning null causes top10=pending in the broadcast rather than a wrong 100% value.
+  if (!accountInfos) return null;
+
+  const resolvedHolders = topAccounts.map((holder, i) => {
+    const data = accountInfos?.[i]?.data;
+    let owner = "";
+    if (data && data.length >= 64) {
+      try { owner = new PublicKey(data.subarray(32, 64)).toBase58(); } catch {}
+    }
+    return { address: holder.address.toBase58(), owner, rawAmount: Number(holder.amount) };
+  });
+
+  const validHolders = resolvedHolders
+    .filter(h =>
+      !excludeOwners.has(h.owner) &&
+      h.address !== curvePDA &&
+      h.address !== curveVaultAddr,
+    )
     .slice(0, 10);
 
-  const top10Raw = holders.reduce((s, h) => s + Number(h.amount), 0);
+  const top10Raw = validHolders.reduce((s, h) => s + h.rawAmount, 0);
   const top10Pct = Math.min(100, (top10Raw / RAW_SUPPLY) * 100);
 
   let devPercentage = 0;
   if (creator) {
     try {
-      const creatorAta = getAssociatedTokenAddress(mintPubkey, new PublicKey(creator));
-      const devHolder = result.value.find(h => h.address.toBase58() === creatorAta.toBase58());
-      if (devHolder) devPercentage = Math.min(100, (Number(devHolder.amount) / RAW_SUPPLY) * 100);
+      const creatorAta = getAssociatedTokenAddress(mintPubkey, new PublicKey(creator)).toBase58();
+      // Match by ATA address OR by resolved owner (handles non-standard ATAs)
+      const devHolder = resolvedHolders.find(h => h.address === creatorAta || h.owner === creator);
+      if (devHolder) devPercentage = Math.min(100, (devHolder.rawAmount / RAW_SUPPLY) * 100);
     } catch {}
   }
 
@@ -77,9 +122,9 @@ export function startHolderSnapshot(
   curvePDA: string,
   platform: string,
 ): Promise<{ top10: string; devPercentage: string } | null> {
-  // 480ms internal timeout: slightly more breathing room without pushing worst-case too far.
-  // Combined with the 450ms grace window in index.ts, total holder budget = 480-930ms.
-  return computeHolderFields(mint, creator, curvePDA, platform, 480);
+  // 700ms: covers two sequential RPCs (getTokenLargestAccounts + getMultipleAccountsInfo).
+  // Combined with the 450ms grace window in index.ts, total holder budget is still < 1.2s.
+  return computeHolderFields(mint, creator, curvePDA, platform, 700);
 }
 
 // ── Scheduled quick risk scan (t=2s fallback) ─────────────────────────────────

@@ -41,6 +41,10 @@ export class YellowstoneManager extends EventEmitter {
   private msgCount = 0;
   private txCount  = 0;
 
+  // Keepalive interval handles — tracked so they can be cleared on reconnect
+  private txKeepaliveInterval: ReturnType<typeof setInterval> | null = null;
+  private accountKeepaliveIntervals: (ReturnType<typeof setInterval> | null)[] = [];
+
   // write_version dedup: skip stale/duplicate account pushes on reconnects (global across all streams)
   private lastWriteVersion = new Map<string, bigint>();
 
@@ -59,8 +63,10 @@ export class YellowstoneManager extends EventEmitter {
 
       // ── 1. Transaction stream ──────────────────────────────────────────────
       this.txStream = await client.subscribe();
+      // Attach error/close handlers immediately — before any write — so h2 resets
+      // that fire synchronously during subscribe() don't become unhandled rejections.
       this.txStream.on("error", (e: any) => this.handleStreamError(e, "txStream"));
-      this.txStream.on("close", () => { console.log("[Yellowstone] txStream closed."); this.handleReconnect(); });
+      this.txStream.on("close", () => { console.log("[Yellowstone] txStream closed."); this.reconnect(); });
       this.setupTxStream();
       this.sendTxSubscription();
 
@@ -68,15 +74,16 @@ export class YellowstoneManager extends EventEmitter {
       this.accountStreams = [];
       this.accountMaps   = [];
       this.accountDebounceTimers = [];
+      this.accountKeepaliveIntervals = [];
       for (let i = 0; i < ACCOUNT_STREAM_COUNT; i++) {
+        if (this.reconnecting) break; // abort if a stream already failed mid-loop
         const stream = await client.subscribe();
-        // Attach error/close handlers immediately — before any write — so h2 resets
-        // that fire synchronously during subscribe() don't become unhandled rejections.
         stream.on("error", (e: any) => this.handleStreamError(e, `accountStream[${i}]`));
-        stream.on("close", () => { console.log(`[Yellowstone] accountStream[${i}] closed.`); this.handleReconnect(); });
+        stream.on("close", () => { console.log(`[Yellowstone] accountStream[${i}] closed.`); this.reconnect(); });
         this.accountStreams.push(stream);
         this.accountMaps.push(new Map());
         this.accountDebounceTimers.push(null);
+        this.accountKeepaliveIntervals.push(null);
         this.setupAccountStream(i);
       }
 
@@ -84,7 +91,7 @@ export class YellowstoneManager extends EventEmitter {
       await this.restoreCurveSubscriptions();
     } catch (err: any) {
       console.error("[Yellowstone] Connect fail:", err.message);
-      this.handleReconnect();
+      this.reconnect();
     }
   }
 
@@ -92,7 +99,9 @@ export class YellowstoneManager extends EventEmitter {
 
   private addRoundRobinIdx = 0;
 
-  public addCurvePDA(curvePDA: string, mint: string, platform: string) {
+  // immediate=true: send the subscription write right now (used on new launches so Geyser
+  // starts watching the curve before the 20ms debounce window expires).
+  public addCurvePDA(curvePDA: string, mint: string, platform: string, immediate = false) {
     // Already tracked — just ensure the account map entry is fresh
     for (let i = 0; i < this.accountMaps.length; i++) {
       if (this.accountMaps[i].has(curvePDA)) {
@@ -123,7 +132,17 @@ export class YellowstoneManager extends EventEmitter {
       if (oldest) map.delete(oldest);
     }
     map.set(curvePDA, { mint, platform });
-    this.scheduleAccountUpdate(targetIdx);
+
+    if (immediate) {
+      // Cancel any pending debounce so this write goes out immediately
+      if (this.accountDebounceTimers[targetIdx]) {
+        clearTimeout(this.accountDebounceTimers[targetIdx]!);
+        this.accountDebounceTimers[targetIdx] = null;
+      }
+      this.sendAccountSubscription(targetIdx);
+    } else {
+      this.scheduleAccountUpdate(targetIdx);
+    }
   }
 
   public removeCurvePDA(curvePDA: string) {
@@ -186,8 +205,11 @@ export class YellowstoneManager extends EventEmitter {
       blocks: {},
       blocksMeta: {},
       commitment: CommitmentLevel.PROCESSED,
-      // Only request the first 50 bytes — all parsers read ≤ 48 bytes (~4× bandwidth reduction)
-      accountsDataSlice: pdas.length > 0 ? [{ offset: "0", length: "50" }] : [],
+      // 320 bytes covers the deepest parser read:
+      //   Meteora DBC VirtualPool: is_migrated @ 305, quote_reserve @ 240
+      //   LaunchLab VirtualPool:   totalFundRaisingB @ 69
+      //   Pump.fun BondingCurve:   complete @ 48
+      accountsDataSlice: pdas.length > 0 ? [{ offset: "0", length: "320" }] : [],
       ...(includePing ? { ping: { id: 1 } } : {}),
     };
     try {
@@ -253,11 +275,13 @@ export class YellowstoneManager extends EventEmitter {
   // ── Stream setup ──────────────────────────────────────────────────────────
 
   private setupTxStream() {
-    // Keepalive every 10s — piggybacks on the subscription write to avoid wiping state
-    setInterval(() => {
+    // Keepalive every 10s — clear any previous interval first to prevent accumulation
+    if (this.txKeepaliveInterval) clearInterval(this.txKeepaliveInterval);
+    this.txKeepaliveInterval = setInterval(() => {
       if (this.txStream && !this.reconnecting) this.sendTxSubscription(true);
     }, 10_000);
 
+    // Data handler only — error/close handlers registered in start() before any write
     this.txStream.on("data", (u: SubscribeUpdate) => {
       this.msgCount++;
       if ((u as any).pong) return;
@@ -269,33 +293,23 @@ export class YellowstoneManager extends EventEmitter {
         this.processTx(u.transaction).catch(() => {});
       }
     });
-
-    this.txStream.on("error", (e: any) => this.handleStreamError(e, "txStream"));
-    this.txStream.on("close", () => {
-      console.log("[Yellowstone] txStream closed.");
-      this.handleReconnect();
-    });
   }
 
   private setupAccountStream(idx: number) {
-    // Keepalive every 10s — must ping each account stream independently
-    setInterval(() => {
+    // Keepalive every 10s — clear any previous interval first to prevent accumulation
+    if (this.accountKeepaliveIntervals[idx]) clearInterval(this.accountKeepaliveIntervals[idx]!);
+    this.accountKeepaliveIntervals[idx] = setInterval(() => {
       if (this.accountStreams[idx] && !this.reconnecting) {
         this.sendAccountSubscription(idx, true);
       }
     }, 10_000);
 
+    // Data handler only — error/close handlers registered in start() before any write
     this.accountStreams[idx].on("data", (u: SubscribeUpdate) => {
       if ((u as any).pong) return;
       if ((u as any).account) {
         this.processAccountUpdate((u as any).account).catch(() => {});
       }
-    });
-
-    this.accountStreams[idx].on("error", (e: any) => this.handleStreamError(e, `accountStream[${idx}]`));
-    this.accountStreams[idx].on("close", () => {
-      console.log(`[Yellowstone] accountStream[${idx}] closed.`);
-      this.handleReconnect();
     });
   }
 
@@ -311,18 +325,34 @@ export class YellowstoneManager extends EventEmitter {
 
   // ── Reconnection ──────────────────────────────────────────────────────────
 
-  private handleReconnect() {
+  // Public so the global unhandledRejection handler can call it safely — it
+  // tears down all streams, clears keepalive intervals, then reconnects with
+  // exponential backoff. Calling reconnect() when already reconnecting is safe.
+  public reconnect() {
     if (this.reconnecting) return;
     this.reconnecting = true;
+
+    // Clear keepalive intervals before destroying streams to prevent stale writes
+    if (this.txKeepaliveInterval) { clearInterval(this.txKeepaliveInterval); this.txKeepaliveInterval = null; }
+    for (const iv of this.accountKeepaliveIntervals) { if (iv) clearInterval(iv); }
+    this.accountKeepaliveIntervals = [];
+
+    // Destroy streams so Chainstack releases concurrent slot counts immediately.
+    // Without this, old h2 streams linger until TCP teardown and the reconnect's
+    // 5 new streams push us over the plan limit → "resource exhausted" cascade.
+    try { this.txStream?.destroy(); } catch {}
+    for (const s of this.accountStreams) { try { s?.destroy(); } catch {} }
+    this.txStream = null;
+    this.accountStreams = [];
+
     // Exponential backoff: 5s, 10s, 20s, 40s … capped at 60s
     const delay = Math.min(5000 * Math.pow(2, this.reconnectAttempts), 60_000);
     this.reconnectAttempts++;
     console.log(`[Yellowstone] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts})...`);
-    // Clear stale stream references so setup methods don't fire on dead objects
-    this.txStream = null;
-    this.accountStreams = [];
     setTimeout(() => { this.reconnecting = false; this.start(); }, delay);
   }
+
+  private handleReconnect() { this.reconnect(); }
 
   // ── Geyser account update handler ────────────────────────────────────────
 
@@ -344,17 +374,26 @@ export class YellowstoneManager extends EventEmitter {
       const last = this.lastWriteVersion.get(pubkey) ?? 0n;
       if (wv <= last) return;
       this.lastWriteVersion.set(pubkey, wv);
+      // Evict oldest entries when the map exceeds total curve capacity to prevent unbounded growth
+      if (this.lastWriteVersion.size > TOTAL_CURVE_CAPACITY + 200) {
+        const oldest = this.lastWriteVersion.keys().next().value;
+        if (oldest) this.lastWriteVersion.delete(oldest);
+      }
     }
 
     const data = Buffer.from(wrapper.account.data);
     if (data.length < 8) return;
+
+    // txnSignature is null/empty for Geyser's initial subscription snapshot (current account
+    // state sent immediately on subscribe). A non-empty signature means a tx triggered it.
+    const isStartup = !wrapper.account.txnSignature || wrapper.account.txnSignature.length === 0;
 
     this.emit("curve-update", {
       curvePDA: pubkey,
       mint: curveInfo.mint,
       platform: curveInfo.platform,
       data,
-      isStartup: !!(wrapper.isStartup),
+      isStartup,
     });
   }
 
@@ -393,7 +432,27 @@ export class YellowstoneManager extends EventEmitter {
       const parsed = parser.parseMetadata(logs, message, meta);
       if (parser.strictMetadata && (!parsed.name || !parsed.symbol)) return;
 
-      const curvePDA = parser.deriveCurvePDA(mint);
+      const curvePDA = parser.deriveCurvePDA(mint, message, meta);
+      if (!curvePDA) {
+        console.error(`[CRITICAL] No curvePDA for mint=${mint.slice(0, 12)} platform=${platformId} — skipping rich path`);
+        const tokenDataSkeleton: Record<string, string> = {
+          mint,
+          creator: maker,
+          curvePDA: "",
+          platform: platformId,
+          name: parsed.name || "",
+          symbol: parsed.symbol || "",
+          uri: parsed.uri || "",
+          createdAt: Date.now().toString(),
+          createdTx: signature,
+          slot: wrapper.slot?.toString() || "0",
+          dataQuality: "skeleton"
+        };
+        this.emit("new-launch", { ...tokenDataSkeleton, signature });
+        return;
+      }
+
+      console.log(`[PDA Debug] platform=${platformId} mint=${mint.slice(0, 12)} pda=${curvePDA.slice(0, 12)}`);
       const slot     = wrapper.slot?.toString() || "0";
 
       console.log(`[Yellowstone] 🚀 NEW (${platformId}): ${parsed.name || ""} ($${parsed.symbol || ""}) | ${mint.slice(0, 12)} | sig=${signature.slice(0, 8)}`);

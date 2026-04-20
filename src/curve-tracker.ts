@@ -1,13 +1,17 @@
 // src/curve-tracker.ts — Bonding curve data: liquidity, price, marketCap, curvePercentage
 // Ongoing curve updates are pushed via Geyser account subscriptions.
 // fetchAndDecodeCurve() is a ONE-TIME call used only for the initial launch broadcast.
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, AccountInfo } from "@solana/web3.js";
 import Redis from "ioredis";
 import "dotenv/config";
 
 import { getParser, CurveState } from "./launchpads";
 
-const connection = new Connection(process.env.SOLANA_RPC!, "processed");
+const connection          = new Connection(process.env.SOLANA_RPC!, "confirmed");
+// Processed-commitment connection for fast probes — matches Geyser's commitment level.
+// 'confirmed' adds 300-400ms of slot finality wait, which was causing the fast probe
+// to timeout at 250ms. 'processed' returns the account as soon as the validator sees it.
+const connectionProcessed = new Connection(process.env.SOLANA_RPC!, "processed");
 
 const redis      = new Redis(process.env.REDIS_URL!);
 
@@ -33,8 +37,18 @@ async function calcVolume24h(mint: string, cutoff: number): Promise<number> {
 }
 
 // ── Curve decoding: delegated entirely to the launchpad parser registry ───────
-function decodeCurveAccount(data: Buffer, platform: string): CurveState | null {
-  return getParser(platform)?.parseCurveData(data) ?? null;
+function decodeCurveAccount(data: Buffer, platform: string, mint?: string): CurveState | null {
+  const result = getParser(platform)?.parseCurveData(data) ?? null;
+  if (!result) {
+    const hexDump = data.slice(0, Math.min(data.length, 80)).toString("hex");
+    const mintTag = mint ? ` mint=${mint.slice(0, 12)}` : "";
+    // For Meteora DBC/Bags: also dump bytes 220-260 so reserves at offset 232 are visible
+    const extraDump = (platform === "meteora" || platform === "bags") && data.length >= 220
+      ? ` hex[220:260]=${data.slice(220, Math.min(data.length, 260)).toString("hex")}`
+      : "";
+    console.warn(`[ZERO CURVE DATA] platform=${platform}${mintTag} dataLen=${data.length} hex[0:80]=${hexDump}${extraDump}`);
+  }
+  return result;
 }
 
 // ── Build Redis update object from decoded curve ─────────────────────────────
@@ -54,14 +68,18 @@ async function buildCurveUpdate(
     ? (virtualSolReservesN / LAMPORTS_PER_SOL) / (virtualTokenReservesN / Math.pow(10, TOKEN_DECIMALS))
     : 0;
 
+  if (priceInSol <= 0) {
+    const p = tokenData.platform || "unknown";
+    console.error(`[CRITICAL] Zero price in curve update — mint=${mint.slice(0, 12)} platform=${p} vSol=${virtualSolReservesN} vToken=${virtualTokenReservesN}`);
+  }
+
   const liquiditySol = virtualSolReservesN / LAMPORTS_PER_SOL;
   const marketCapSol = priceInSol * TOTAL_SUPPLY;
   const volume24h    = await calcVolume24h(mint, Date.now() - 86_400_000);
 
   let gradStatus = "new";
-  if (complete)              gradStatus = "graduated";
-  else if (curvePercentage >= 80) gradStatus = "graduating";
-  else if (curvePercentage >= 50) gradStatus = "active";
+  if (complete)                    gradStatus = "graduated";
+  else if (curvePercentage >= 80)  gradStatus = "graduating";
 
   return {
     priceQuote:           priceInSol.toString(),
@@ -92,15 +110,33 @@ export async function fetchAndDecodeCurve(
   curvePDA: string,
   platform: string,
   timeoutMs = 800,
+  commitment: "processed" | "confirmed" = "processed",
 ): Promise<Record<string, string> | null> {
+  const conn = commitment === "processed" ? connectionProcessed : connection;
   try {
     const rpc = (async () => {
-      const [accountInfo, solPrice] = await Promise.all([
-        connection.getAccountInfo(new PublicKey(curvePDA), "processed"),
-        getSolPrice(),
-      ]);
-      if (!accountInfo?.data) return null;
-      const decoded = decodeCurveAccount(Buffer.from(accountInfo.data), platform);
+      let accountInfo: AccountInfo<Buffer> | null = null;
+      let solPrice = 0;
+      
+      // Retry up to 3 times for new accounts (RPC indexing lag)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const [info, price] = await Promise.all([
+          conn.getAccountInfo(new PublicKey(curvePDA), commitment),
+          getSolPrice(),
+        ]);
+        accountInfo = info;
+        solPrice = price;
+        if (accountInfo) break;
+        if (attempt < 2 && commitment === "processed") await new Promise(r => setTimeout(r, 150));
+        else break; // don't retry confirmed
+      }
+
+      if (!accountInfo) {
+        console.warn(`[CurveTracker] account not found after retries — platform=${platform} curvePDA=${curvePDA.slice(0, 12)} mint=${mint.slice(0, 12)} commitment=${commitment}`);
+        return null;
+      }
+      if (!accountInfo.data) return null;
+      const decoded = decodeCurveAccount(Buffer.from(accountInfo.data), platform, mint);
       if (!decoded) return null;
       return await buildCurveUpdate(mint, decoded, {}, solPrice);
     })();
@@ -121,7 +157,7 @@ export async function processCurveAccountUpdate(
   platform: string,
   isStartup = false,
 ): Promise<Record<string, string> | null> {
-  const decoded = decodeCurveAccount(data, platform);
+  const decoded = decodeCurveAccount(data, platform, mint);
   if (!decoded) return null;
 
   const [tokenData, solPrice] = await Promise.all([
@@ -140,7 +176,6 @@ export async function processCurveAccountUpdate(
 
   if (tokenData?.mint) {
     await redis.hset(`token:${mint}`, update);
-    // Skip broadcast for startup state seeding — clients don't need spurious updates on reconnect
     if (!isStartup) {
       await redis.publish("token-updates", mint);
     }

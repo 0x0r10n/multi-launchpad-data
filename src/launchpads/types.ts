@@ -47,10 +47,13 @@ export interface LaunchpadParser {
   parseMetadata(logs: string[], message: any, meta: any): TokenMetadata;
 
   /**
-   * Derives the bonding curve account PDA for a mint.
+   * Returns the bonding curve / pool account address for a mint.
+   * Passes the raw transaction context (message + meta) so parsers that cannot
+   * derive the PDA from the mint alone (e.g. Meteora DBC — needs config key)
+   * can extract the address directly from the initialization instruction accounts.
    * Returns "" on failure — caller must check.
    */
-  deriveCurvePDA(mint: string): string;
+  deriveCurvePDA(mint: string, message?: any, meta?: any): string;
 
   /**
    * Decodes raw bonding curve account data.
