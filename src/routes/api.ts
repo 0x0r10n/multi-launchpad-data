@@ -183,6 +183,7 @@ router.get("/token/:mint/metadata", rl(300), wrap(async (req, res) => {
 
   res.set("Cache-Control", "public, max-age=30");
   res.json({
+    success:           true,
     mint,
     name:              name     || "Unknown Token",
     symbol:            symbol   || "???",
@@ -262,6 +263,7 @@ router.get("/token/:mint/pairs", rl(300), wrap(async (req, res) => {
 
   res.set("Cache-Control", "public, max-age=8");
   res.json({
+    success: true,
     mint,
     pairs: [{
       pairAddress:     curvePDA || "",
@@ -293,7 +295,7 @@ router.get("/token/:mint/history", rl(300), wrap(async (req, res) => {
   const limit   = Math.min(parseInt(req.query.limit as string) || 300, 1000);
   const history = await getPriceHistory(req.params.mint as string, limit);
   res.set("Cache-Control", "public, max-age=5");
-  res.json({ mint: req.params.mint, count: history.length, history });
+  res.json({ success: true, mint: req.params.mint, count: history.length, history });
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,6 +320,7 @@ router.get("/price/:mint", rl(300), wrap(async (req, res) => {
 
   res.set("Cache-Control", "public, max-age=5");
   res.json({
+    success:      true,
     mint,
     price:       { native: parseFloat(pq || "0"), usd: parseFloat(pu || "0") },
     marketCapUsd: parseFloat(mcap   || "0"),
@@ -408,7 +411,7 @@ router.get("/price/:mint/history", rl(300), wrap(async (req, res) => {
   });
 
   res.set("Cache-Control", "public, max-age=10");
-  res.json(result);
+  res.json({ success: true, ...result });
 }));
 
 /**
@@ -445,7 +448,7 @@ router.post("/price/multiple", rl(300), wrap(async (req, res) => {
   }
 
   res.set("Cache-Control", "public, max-age=5");
-  res.json({ prices, count: Object.keys(prices).length, requested: bounded.length });
+  res.json({ success: true, prices, count: Object.keys(prices).length, requested: bounded.length });
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -618,7 +621,7 @@ router.get("/wallet/:wallet/transactions", rl(60), wrap(async (req, res) => {
   });
 
   res.set("Cache-Control", "private, max-age=15");
-  res.json(result);
+  res.json({ success: true, ...result });
 }));
 
 /**
@@ -675,7 +678,7 @@ router.get("/wallet/:wallet/history", rl(60), wrap(async (req, res) => {
   });
 
   res.set("Cache-Control", "private, max-age=30");
-  res.json(result);
+  res.json({ success: true, ...result });
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -689,9 +692,10 @@ router.get("/wallet/:wallet/history", rl(60), wrap(async (req, res) => {
 router.get("/stats", rl(300), wrap(async (_req, res) => {
   const tokenCount = await redis.zcard("tokens:latest");
   res.json({
-    status:       "running",
+    success:       true,
+    status:        "running",
     tokensInRedis: tokenCount,
-    uptime:       process.uptime().toFixed(0) + "s",
-    timestamp:    new Date().toISOString(),
+    uptime:        process.uptime().toFixed(0) + "s",
+    timestamp:     new Date().toISOString(),
   });
 }));
