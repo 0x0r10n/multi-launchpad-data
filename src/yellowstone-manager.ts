@@ -8,6 +8,7 @@ import "dotenv/config";
 
 import { detectParser, resolveMeteoraId, LAUNCHPAD_PROGRAM_IDS } from "./launchpads";
 import { bootstrapDevStatsIfNeeded } from "./dev-stats";
+import { parseSwap } from "./swap-parser";
 
 // Known quote/stablecoin tokens that appear in postTokenBalances but are never new launch mints
 const QUOTE_TOKENS = new Set([
@@ -521,6 +522,18 @@ export class YellowstoneManager extends EventEmitter {
     await pipe.exec();
 
     this.emit("trade", { mint, signature, type: swapType, solAmount, maker, slot: wrapper.slot });
+
+    // Fire-and-forget: precise swap extraction runs after the hot path completes.
+    // Uses directional token-delta logic (buy = max-positive, sell = max-negative ATA)
+    // which correctly handles ALTs, inner CPIs, and versioned transactions.
+    setImmediate(() => {
+      try {
+        const swap = parseSwap(wrapper, mint, swapType, maker);
+        this.emit("swap", swap);
+      } catch (e: any) {
+        console.error("[SwapParser] error:", e.message);
+      }
+    });
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

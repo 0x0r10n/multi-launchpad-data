@@ -287,6 +287,67 @@ router.get("/token/:mint/pairs", rl(300), wrap(async (req, res) => {
 }));
 
 /**
+ * GET /api/token/:mint/trades
+ * Live swap history with exact SOL + token amounts, precise priority fees.
+ * Scores are Solana slot numbers — naturally ordered and deduplicated by signature.
+ *
+ * Query:
+ *   limit   number  default 50, max 500
+ *   before  string  signature from previous page's nextCursor (exclusive, cursor pagination)
+ *
+ * Cursor usage:
+ *   First page:  GET /api/token/:mint/trades?limit=50
+ *   Next page:   GET /api/token/:mint/trades?limit=50&before=<nextCursor>
+ */
+router.get("/token/:mint/trades", rl(300), wrap(async (req, res) => {
+  const mint   = req.params.mint as string;
+  const limit  = Math.min(parseInt(req.query.limit as string) || 50, 500);
+  const before = req.query.before as string | undefined;
+
+  // Resolve signature cursor → slot for ZREVRANGEBYSCORE
+  let upperBound = "+inf";
+  if (before) {
+    const metaRaw = await redis.hget(`txs_meta:${mint}`, before);
+    if (!metaRaw) {
+      return res.json({ success: true, data: [], nextCursor: null });
+    }
+    const { slot } = JSON.parse(metaRaw);
+    upperBound = `(${slot}`;
+  }
+
+  const raw = await redis.zrevrangebyscore(
+    `txs:${mint}`, upperBound, "-inf", "WITHSCORES", "LIMIT", 0, limit,
+  );
+
+  const data: any[] = [];
+  const sigs: string[] = [];
+  for (let i = 0; i < raw.length; i += 2) {
+    try {
+      const entry = JSON.parse(raw[i]);
+      entry.slot = parseInt(raw[i + 1]);
+      data.push(entry);
+      sigs.push(entry.signature);
+    } catch {}
+  }
+
+  // Batch-fetch timestamps
+  if (sigs.length > 0) {
+    const metas = await redis.hmget(`txs_meta:${mint}`, ...sigs);
+    for (let i = 0; i < data.length; i++) {
+      try {
+        const m = metas[i] ? JSON.parse(metas[i]!) : null;
+        data[i].timestamp = m?.ts ?? null;
+      } catch { data[i].timestamp = null; }
+    }
+  }
+
+  const nextCursor = data.length === limit ? (data[data.length - 1]?.signature ?? null) : null;
+
+  res.set("Cache-Control", "public, max-age=3");
+  res.json({ success: true, data, nextCursor });
+}));
+
+/**
  * GET /api/token/:mint/history
  * Raw price ticks (time, price in SOL, price in USD).
  * Query: limit (default 300, max 1000)

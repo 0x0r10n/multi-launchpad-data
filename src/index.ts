@@ -121,6 +121,38 @@ io.on("connection", (socket) => {
             socket.emit("snapshot", { type: "snapshot", room, data: payload });
           }
         }
+
+      } else if (room.startsWith("transactions:")) {
+        const mint = room.slice("transactions:".length);
+        if (mint) {
+          // Newest 100 entries, slot-ordered descending (highest slot first)
+          const raw = await redis.zrevrange(`txs:${mint}`, 0, 99, "WITHSCORES");
+          const history: any[] = [];
+          const sigs: string[] = [];
+          for (let i = 0; i < raw.length; i += 2) {
+            try {
+              const entry = JSON.parse(raw[i]);
+              entry.slot = parseInt(raw[i + 1]);
+              history.push(entry);
+              sigs.push(entry.signature);
+            } catch {}
+          }
+          // Batch-fetch timestamps from secondary index
+          if (sigs.length > 0) {
+            const metas = await redis.hmget(`txs_meta:${mint}`, ...sigs);
+            for (let i = 0; i < history.length; i++) {
+              try {
+                const m = metas[i] ? JSON.parse(metas[i]!) : null;
+                history[i].timestamp = m?.ts ?? null;
+              } catch { history[i].timestamp = null; }
+            }
+          }
+          socket.emit("snapshot", {
+            type: "snapshot",
+            room,
+            data: { mint, count: history.length, history },
+          });
+        }
       }
     } catch (e: any) {
       console.error(`[WS] Snapshot failed for room ${room}:`, e.message);
@@ -379,6 +411,63 @@ yellowstone.on("trade", async (data: any) => {
   // Trigger risk analysis if not yet analyzed
   const analyzed = await redis.hget(`token:${data.mint}`, "riskAnalyzedAt");
   if (!analyzed) queueRiskAnalysis(data.mint);
+});
+
+yellowstone.on("swap", async (data: any) => {
+  if (!data.mint || !data.success) return;
+
+  const now  = Date.now();
+  const pipe = redis.pipeline();
+
+  // txs:{mint}: score = slot for stable ordering + natural signature dedup.
+  // Member is deterministic (no timestamp) so ZADD silently deduplicates Geyser re-deliveries.
+  // Capped at 500 entries (trim when > 550 to batch the cleanup).
+  const priorityFeeSOL = parseFloat((data.priorityFeeLamports / 1e9).toFixed(9));
+  const txEntry = JSON.stringify({
+    signature:      data.signature,
+    type:           data.type,
+    sol:            data.solAmount,
+    tokens:         data.tokenAmount,
+    maker:          data.maker,
+    priorityFeeSOL,
+  });
+  pipe.zadd(`txs:${data.mint}`, data.slot, txEntry);
+  pipe.zremrangebyrank(`txs:${data.mint}`, 0, -552);   // keep newest 551; trim fires only after 551st entry
+  pipe.expire(`txs:${data.mint}`, 86_400);
+  // txs_meta:{mint}: sig → {slot, ts} for signature-based cursor + timestamp enrichment
+  pipe.hset(`txs_meta:${data.mint}`, data.signature, JSON.stringify({ slot: data.slot, ts: now }));
+  pipe.expire(`txs_meta:${data.mint}`, 86_400);
+
+  // trades_full:{mint}: time-scored for OHLCV volume calculations (separate from txs)
+  pipe.zadd(
+    `trades_full:${data.mint}`, now,
+    `${data.type}:${data.solAmount.toFixed(9)}:${data.tokenAmount.toFixed(data.decimals)}:${data.signature.slice(0, 8)}`,
+  );
+  pipe.zremrangebyscore(`trades_full:${data.mint}`, 0, now - 86_400_000);
+  pipe.expire(`trades_full:${data.mint}`, 86_400);
+
+  // Dust buy filter: remove wallets that paid < 0.001 SOL from the sniper set
+  if (data.type === "buy" && data.maker && data.solAmount < 0.001) {
+    pipe.srem(`snipers_set:${data.mint}`, data.maker);
+  }
+
+  await pipe.exec().catch(() => {});
+
+  const txPayload = {
+    signature:      data.signature,
+    timestamp:      now,
+    slot:           data.slot,
+    type:           data.type,
+    sol:            data.solAmount,
+    tokens:         data.tokenAmount,
+    decimals:       data.decimals,
+    maker:          data.maker,
+    priorityFeeSOL,
+    mint:           data.mint,
+  };
+
+  io.to(`transactions:${data.mint}`).emit("tx", txPayload);
+  io.to(`token:${data.mint}`).emit("trade-enriched", txPayload);
 });
 
 // ========== BACKGROUND UPDATES (PUBSUB) ==========
