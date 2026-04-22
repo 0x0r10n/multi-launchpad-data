@@ -922,3 +922,183 @@ Exceeding limits returns HTTP 429:
 ```json
 { "error": "Rate limit exceeded", "retryAfterMs": 60000 }
 ```
+
+---
+
+## Global Chart Indexer (Any Token)
+
+The system supports **any Solana SPL token** — not just launchpad tokens. When you request data for an unknown token, it's automatically discovered and tracked via on-chain Raydium AMM V4 pool data. **Zero third-party APIs** — all data comes from on-chain RPC reads.
+
+### Architecture
+
+```
+User requests chart for unknown mint
+  │
+  ├─► pool-resolver.ts
+  │     └── getProgramAccounts (memcmp on baseMint/quoteMint offset)
+  │     └── Caches pool address in Redis pool:{mint} for 24h
+  │
+  ├─► global-tracker.ts
+  │     ├── seedTokenMetadata()  — Metaplex on-chain metadata (name/symbol/uri)
+  │     ├── seedInitialPrice()   — Reads vault token account balances → price
+  │     ├── pollAllWatched()     — Every 10s: re-read vault balances → price ticks
+  │     ├── pollAllTrades()      — Every 15s: getSignaturesForAddress → swap extraction
+  │     └── cleanup()            — Every 5min: evict tokens idle >48h
+  │
+  ├─► candlesticks.ts
+  │     └── Aggregates price:{mint} ticks + trades:{mint} volume into OHLCV candles
+  │
+  └─► Same Redis keys as launchpad tokens:
+        token:{mint}  — Hash (price, liquidity, metadata)
+        price:{mint}  — List (price ticks for charts)
+        trades:{mint} — Sorted Set (swap events for volume)
+```
+
+### Internal Polling Cycles
+
+| Cycle | Interval | What it does | RPC calls per token |
+|-------|----------|-------------|---------------------|
+| **Price poll** | 10s | Reads pool account + 2 vault token balances → computes price from reserves | 3 |
+| **Trade poll** | 15s | `getSignaturesForAddress` on pool → `getParsedTransactions` → extracts buy/sell/SOL amount | 1-5 |
+| **Cleanup** | 5min | Evicts tokens with no activity for 48h | 0 |
+
+**RPC budget at capacity (200 tokens):**
+- Price poll: 200 × 3 calls / 10s = 60 rps
+- Trade poll: 200 × 3 calls / 15s = 40 rps
+- Total: ~100 rps — well within standard RPC limits
+
+### Capacity and Eviction
+
+| Setting | Value |
+|---------|-------|
+| Max global tokens | 200 |
+| Idle timeout | 48 hours |
+| Eviction strategy | LRU (least recently accessed) |
+| Pool cache TTL | 24 hours |
+| Trade history window | Rolling 24 hours |
+
+### Redis Schema (Global Tokens)
+
+| Key | Type | TTL | Description |
+|-----|------|-----|-------------|
+| `pool:{mint}` | Hash | 24h | `{ poolAddress, poolType, programId, baseMint, quoteMint }` |
+| `global:watched` | Set | — | All currently-watched global mints |
+| `global:lastAccess:{mint}` | String | — | Epoch ms of last chart room join (for LRU) |
+| `token:{mint}` | Hash | — | Same as launchpad tokens, with `platform: "raydium"`, `isGlobal: "true"` |
+| `price:{mint}` | List | — | Same tick format: `{ time, price, price_usd }` |
+| `trades:{mint}` | Sorted Set | — | Same format: `"type:solAmount:timestamp"` scored by epoch-ms |
+
+### How it works
+
+1. **Auto-watch on request** — Calling `GET /api/price/:mint` or `GET /api/price/:address/candlesticks` for an unknown token automatically triggers pool discovery and tracking.
+2. **WebSocket auto-watch** — Joining `chart:{mint}` or `token:{mint}` rooms for unknown tokens automatically starts tracking.
+3. **First request returns 202** — While price data is being seeded (~5-10s), subsequent requests will return full data.
+4. **Price polling (10s)** — Vault token account balances are read via RPC to compute price from on-chain reserves.
+5. **Trade polling (15s)** — Recent Raydium swap transactions are fetched via `getSignaturesForAddress` and parsed to extract buy/sell direction and SOL volume.
+6. **48h idle cleanup** — Tokens with no chart room activity for 48 hours are automatically unwatched.
+7. **200 token cap** — LRU eviction protects RPC budget.
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| `src/launchpads/raydium.ts` | Raydium AMM V4 pool decoder. Correct offsets from Raydium's `state.rs` source. Reads vault token account balances for reserves. |
+| `src/pool-resolver.ts` | Discovers Raydium pool for any mint via `getProgramAccounts` with `memcmp` filters on `baseMint` (offset 400) and `quoteMint` (offset 432). |
+| `src/global-tracker.ts` | Core engine: watch/unwatch/poll/evict lifecycle. Metaplex metadata seeding, initial price seeding, 10s price poll, 15s trade poll. |
+| `src/candlesticks.ts` | OHLCV aggregator matching Moralis/Axiom schema. 13 timeframes, USD/native currency, volume from `trades:{mint}`. |
+| `src/trade-poller.ts` | RPC-based Raydium swap extraction. Uses `getSignaturesForAddress` + `getParsedTransactions` to detect buy/sell events and SOL amounts. |
+
+---
+
+### `POST /api/price/:mint/watch`
+
+Explicitly start tracking a token. Rate limit: 60 req/min.
+
+```json
+// Response (tracking started)
+{ "success": true, "status": "discovering", "mint": "DezXAZ...", "since": null, "watchedCount": 42 }
+
+// Response (already tracked — launchpad or global)
+{ "success": true, "status": "tracking", "mint": "DezXAZ...", "since": 1713600000000, "watchedCount": 42 }
+```
+
+### `DELETE /api/price/:mint/watch`
+
+Stop tracking a globally-watched token. Frees capacity. Rate limit: 60 req/min.
+
+```json
+{ "success": true, "removed": true, "mint": "DezXAZ...", "watchedCount": 41 }
+```
+
+### `GET /api/global/status`
+
+Returns the global tracker state. Rate limit: 300 req/min.
+
+```json
+{ "success": true, "watchedCount": 42, "maxCapacity": 200, "uptime": "3600s" }
+```
+
+### `GET /api/price/:address/candlesticks`
+
+OHLCV candlestick data matching the Moralis/Axiom API schema. Works for **any** token (launchpad or global). Rate limit: 100 req/min.
+
+**Query Parameters:**
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `timeframe` | No | `1min` | Candle interval: `1s`, `10s`, `30s`, `1min`, `5min`, `10min`, `30min`, `1h`, `4h`, `12h`, `1d`, `1w`, `1M` |
+| `fromDate` | No | 24h ago | Start time (unix seconds or ISO date string) |
+| `toDate` | No | now | End time (unix seconds or ISO date string) |
+| `currency` | No | `usd` | Price currency: `usd` or `native` (SOL) |
+| `limit` | No | `100` | Max candles (1-1000) |
+
+**Response:**
+
+```json
+{
+  "cursor": null,
+  "page": 1,
+  "pairAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  "tokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  "timeframe": "5min",
+  "currency": "usd",
+  "result": [
+    {
+      "timestamp": "2024-10-09T12:00:00.000Z",
+      "open": 0.00042,
+      "close": 0.00045,
+      "high": 0.00047,
+      "low": 0.00041,
+      "volume": 12.5,
+      "trades": 34
+    }
+  ]
+}
+```
+
+### `GET /api/price/:mint` (Enhanced)
+
+Now auto-triggers tracking for unknown tokens. Returns 202 while warming up.
+
+```json
+// First request for unknown token — 202 response
+{
+  "success": true,
+  "status": "discovering",
+  "mint": "DezXAZ...",
+  "message": "Token tracking initiated. Price data will be available within 5-10 seconds."
+}
+
+// Subsequent requests — 200 response (same shape as before)
+{
+  "success": true,
+  "mint": "DezXAZ...",
+  "price": { "native": 0.00042, "usd": 0.059 },
+  "marketCapUsd": 59000000,
+  "liquidity": { "native": 1234.5, "usd": 172830 },
+  "priceChange": { "1m": 0.5, "5m": -1.2, "15m": 2.1, "30m": 3.4, "1h": -0.8, "4h": 5.2, "24h": 12.3 },
+  "volume": { "24h": 45.2, "all": 120.5 },
+  "updatedAt": 1713600000000
+}
+```
+
