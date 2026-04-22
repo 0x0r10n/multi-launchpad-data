@@ -1102,6 +1102,161 @@ Now auto-triggers tracking for unknown tokens. Returns 202 while warming up.
 }
 ```
 
+### Client Integration Examples
+
+#### Auto-Watch + Candlestick Chart (React + Lightweight Charts)
+
+```tsx
+import { useEffect, useState } from 'react';
+import { createChart } from 'lightweight-charts';
+import { io } from 'socket.io-client';
+
+const API = 'https://your-api.com/api';
+const socket = io('https://your-api.com');
+
+function TokenChart({ mint }: { mint: string }) {
+  const [status, setStatus] = useState<'loading' | 'ready' | 'warming'>('loading');
+
+  useEffect(() => {
+    const chart = createChart(document.getElementById('chart')!, {
+      width: 800, height: 400,
+      layout: { background: { color: '#0a0a0f' }, textColor: '#a0a0b0' },
+    });
+    const candleSeries = chart.addCandlestickSeries();
+
+    // 1. Fetch initial candles (auto-triggers tracking for unknown tokens)
+    async function loadCandles() {
+      const res = await fetch(
+        `${API}/price/${mint}/candlesticks?timeframe=5min&limit=200`
+      );
+
+      if (res.status === 202) {
+        // Token is being discovered — wait and retry
+        setStatus('warming');
+        setTimeout(loadCandles, 5000);
+        return;
+      }
+
+      const data = await res.json();
+      candleSeries.setData(
+        data.result.map((c: any) => ({
+          time: Math.floor(new Date(c.timestamp).getTime() / 1000),
+          open: c.open, high: c.high, low: c.low, close: c.close,
+        }))
+      );
+      setStatus('ready');
+    }
+
+    loadCandles();
+
+    // 2. Join WebSocket room for live updates (also auto-triggers tracking)
+    socket.emit('join', `chart:${mint}`);
+    socket.on('price-update', (update: any) => {
+      if (update.mint === mint) {
+        candleSeries.update({
+          time: Math.floor(Date.now() / 1000),
+          open: update.price_usd, high: update.price_usd,
+          low: update.price_usd, close: update.price_usd,
+        });
+      }
+    });
+
+    return () => {
+      socket.emit('leave', `chart:${mint}`);
+      chart.remove();
+    };
+  }, [mint]);
+
+  return (
+    <div>
+      {status === 'warming' && <p>Discovering token... charts loading in ~5s</p>}
+      <div id="chart" />
+    </div>
+  );
+}
+```
+
+#### Fetch Volume-Enriched Candles (vanilla JS)
+
+```js
+async function getCandles(mint, timeframe = '1h', hours = 24) {
+  const fromDate = Math.floor(Date.now() / 1000) - hours * 3600;
+  const res = await fetch(
+    `/api/price/${mint}/candlesticks?timeframe=${timeframe}&fromDate=${fromDate}&currency=usd&limit=500`
+  );
+  const { result } = await res.json();
+
+  // Each candle includes volume (SOL) and trade count
+  for (const candle of result) {
+    console.log(
+      `${candle.timestamp} | O:${candle.open} H:${candle.high} L:${candle.low} C:${candle.close}`,
+      `| Vol: ${candle.volume} SOL | Trades: ${candle.trades}`
+    );
+  }
+  return result;
+}
+```
+
+#### Explicitly Watch a Token (e.g., from a search bar)
+
+```js
+async function watchToken(mint) {
+  const res = await fetch(`/api/price/${mint}/watch`, { method: 'POST' });
+  const data = await res.json();
+
+  if (data.status === 'discovering') {
+    // Poll until ready
+    const poll = setInterval(async () => {
+      const check = await fetch(`/api/price/${mint}`);
+      if (check.status === 200) {
+        clearInterval(poll);
+        console.log('Token ready:', await check.json());
+      }
+    }, 3000);
+  } else {
+    console.log('Already tracking:', data);
+  }
+}
+```
+
+#### WebSocket Live Price Feed (React hook)
+
+```tsx
+function useLivePrice(mint: string) {
+  const [price, setPrice] = useState<{ native: number; usd: number } | null>(null);
+
+  useEffect(() => {
+    const socket = io('https://your-api.com');
+
+    // Joining chart room auto-watches the token
+    socket.emit('join', `chart:${mint}`);
+
+    socket.on('price-update', (data: any) => {
+      if (data.mint === mint) {
+        setPrice({ native: data.price, usd: data.price_usd });
+      }
+    });
+
+    return () => {
+      socket.emit('leave', `chart:${mint}`);
+      socket.disconnect();
+    };
+  }, [mint]);
+
+  return price;
+}
+```
+
+#### Global Tracker Status Dashboard
+
+```js
+async function showTrackerStatus() {
+  const res = await fetch('/api/global/status');
+  const data = await res.json();
+  console.log(`Tracking ${data.watchedCount}/${data.maxCapacity} tokens | Uptime: ${data.uptime}`);
+}
+```
+
 ---
 
 ## Wallet PnL API
@@ -1288,4 +1443,255 @@ Returns the per-token PnL object, or 404 if no trades found.
 | `src/pnl/wallet-scanner.ts` | RPC-based wallet transaction scanner. Extracts normalized trades from parsed transactions. |
 | `src/pnl/pnl-engine.ts` | Weighted-average cost basis PnL computation engine with Redis caching. |
 
+### Client Integration Examples
 
+#### Portfolio PnL Dashboard (React)
+
+```tsx
+import { useEffect, useState } from 'react';
+
+const API = 'https://your-api.com/api';
+
+interface TokenPnl {
+  mint: string;
+  holding: number;
+  realized: number;
+  unrealized: number;
+  total: number;
+  total_invested: number;
+  current_value: number;
+  cost_basis: number;
+  average_buy_amount: number;
+  buy_transactions: number;
+  sell_transactions: number;
+  total_transactions: number;
+}
+
+interface PnlData {
+  wallet: string;
+  summary: {
+    realized: number;
+    unrealized: number;
+    total: number;
+    totalInvested: number;
+    currentValue: number;
+    tokenCount: number;
+  };
+  tokens: Record<string, TokenPnl>;
+  updatedAt: number;
+}
+
+function WalletPnL({ wallet }: { wallet: string }) {
+  const [pnl, setPnl] = useState<PnlData | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function fetchPnl() {
+      setLoading(true);
+      const res = await fetch(`${API}/wallet/${wallet}/pnl`);
+      const data = await res.json();
+      if (data.success) setPnl(data);
+      setLoading(false);
+    }
+    fetchPnl();
+    // Refresh every 2 minutes
+    const interval = setInterval(fetchPnl, 120_000);
+    return () => clearInterval(interval);
+  }, [wallet]);
+
+  if (loading) return <p>Scanning wallet history...</p>;
+  if (!pnl) return <p>Failed to load PnL</p>;
+
+  const { summary, tokens } = pnl;
+
+  return (
+    <div>
+      {/* Summary Card */}
+      <div className="pnl-summary">
+        <h2>Portfolio PnL</h2>
+        <div className={`total ${summary.total >= 0 ? 'profit' : 'loss'}`}>
+          ${summary.total.toFixed(2)}
+        </div>
+        <div>Realized: ${summary.realized.toFixed(2)}</div>
+        <div>Unrealized: ${summary.unrealized.toFixed(2)}</div>
+        <div>Invested: ${summary.totalInvested.toFixed(2)}</div>
+        <div>Current Value: ${summary.currentValue.toFixed(2)}</div>
+        <div>{summary.tokenCount} tokens traded</div>
+      </div>
+
+      {/* Per-Token Positions */}
+      <table>
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Realized</th>
+            <th>Unrealized</th>
+            <th>Total P&L</th>
+            <th>Holding Value</th>
+            <th>Avg Buy</th>
+            <th>Trades</th>
+          </tr>
+        </thead>
+        <tbody>
+          {Object.values(tokens)
+            .sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
+            .map(t => (
+              <tr key={t.mint}>
+                <td title={t.mint}>{t.mint.slice(0, 8)}...</td>
+                <td className={t.realized >= 0 ? 'profit' : 'loss'}>
+                  ${t.realized.toFixed(2)}
+                </td>
+                <td className={t.unrealized >= 0 ? 'profit' : 'loss'}>
+                  ${t.unrealized.toFixed(2)}
+                </td>
+                <td className={t.total >= 0 ? 'profit' : 'loss'}>
+                  ${t.total.toFixed(2)}
+                </td>
+                <td>${t.current_value.toFixed(2)}</td>
+                <td>${t.average_buy_amount.toFixed(8)}</td>
+                <td>{t.total_transactions}</td>
+              </tr>
+            ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+#### Single Token PnL Card (vanilla JS)
+
+```js
+async function showTokenPnl(wallet, mint) {
+  const res = await fetch(`/api/wallet/${wallet}/pnl/${mint}`);
+
+  if (res.status === 404) {
+    console.log('No trades found for this token');
+    return null;
+  }
+
+  const data = await res.json();
+
+  console.log(`Token: ${data.mint}`);
+  console.log(`Status: ${data.holding > 0 ? 'OPEN' : 'CLOSED'}`);
+  console.log(`Invested: $${data.total_invested.toFixed(2)}`);
+  console.log(`Realized P&L: $${data.realized.toFixed(2)}`);
+  console.log(`Unrealized P&L: $${data.unrealized.toFixed(2)}`);
+  console.log(`Total P&L: $${data.total.toFixed(2)}`);
+  console.log(`ROI: ${((data.total / data.total_invested) * 100).toFixed(1)}%`);
+  console.log(`Avg Buy: $${data.average_buy_amount.toFixed(8)}`);
+  console.log(`Holding: ${data.holding.toLocaleString()} tokens`);
+  console.log(`Current Value: $${data.current_value.toFixed(2)}`);
+  console.log(`Trades: ${data.buy_transactions} buys, ${data.sell_transactions} sells`);
+
+  return data;
+}
+```
+
+#### React Hook: `useWalletPnl`
+
+```tsx
+function useWalletPnl(wallet: string | null) {
+  const [data, setData] = useState<PnlData | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!wallet) return;
+
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    fetch(`/api/wallet/${wallet}/pnl`)
+      .then(res => res.json())
+      .then(json => {
+        if (cancelled) return;
+        if (json.success) setData(json);
+        else setError(json.error || 'Unknown error');
+      })
+      .catch(err => {
+        if (!cancelled) setError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [wallet]);
+
+  return { data, loading, error };
+}
+
+// Usage:
+function App() {
+  const { data, loading, error } = useWalletPnl('7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU');
+
+  if (loading) return <p>Loading PnL...</p>;
+  if (error) return <p>Error: {error}</p>;
+  if (!data) return null;
+
+  return (
+    <div>
+      <h1>Total P&L: ${data.summary.total.toFixed(2)}</h1>
+      <p>{data.summary.tokenCount} tokens | {data.summary.totalTransactions} trades</p>
+    </div>
+  );
+}
+```
+
+#### Combine PnL + Chart (full trading view)
+
+```tsx
+// Show a token's chart alongside the user's PnL for that token
+function TradeView({ wallet, mint }: { wallet: string; mint: string }) {
+  const [tokenPnl, setTokenPnl] = useState(null);
+  const [candles, setCandles] = useState([]);
+
+  useEffect(() => {
+    // Fetch both in parallel
+    Promise.all([
+      fetch(`/api/wallet/${wallet}/pnl/${mint}`).then(r => r.json()),
+      fetch(`/api/price/${mint}/candlesticks?timeframe=5min&limit=200`).then(r => r.json()),
+    ]).then(([pnlData, chartData]) => {
+      if (pnlData.success) setTokenPnl(pnlData);
+      setCandles(chartData.result || []);
+    });
+  }, [wallet, mint]);
+
+  return (
+    <div className="trade-view">
+      <div className="chart-panel">
+        {/* Render candles with lightweight-charts */}
+      </div>
+      <div className="pnl-panel">
+        {tokenPnl && (
+          <>
+            <div>Invested: ${tokenPnl.total_invested.toFixed(2)}</div>
+            <div>P&L: ${tokenPnl.total.toFixed(2)}</div>
+            <div>ROI: {((tokenPnl.total / tokenPnl.total_invested) * 100).toFixed(1)}%</div>
+            <div>Holding: {tokenPnl.holding.toLocaleString()}</div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+#### cURL Examples
+
+```bash
+# Full wallet PnL
+curl -s https://your-api.com/api/wallet/7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU/pnl | jq '.summary'
+
+# Single token PnL
+curl -s https://your-api.com/api/wallet/7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU/pnl/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 | jq
+
+# Watch any token + get candles
+curl -X POST https://your-api.com/api/price/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/watch
+curl -s 'https://your-api.com/api/price/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/candlesticks?timeframe=5min&limit=50' | jq '.result | length'
+
+# Global tracker status
+curl -s https://your-api.com/api/global/status | jq
+```
