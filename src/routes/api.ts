@@ -8,6 +8,9 @@ import { AccountLayout, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 import { getPriceHistory } from "../price-tracker";
 import { buildTokenPayload }  from "../payload-builder";
+import { getCandlesticks } from "../candlesticks";
+import { globalTracker } from "../global-tracker";
+import { computeWalletPnl, getTokenPnl } from "../pnl/pnl-engine";
 
 const redis      = new Redis(process.env.REDIS_URL!);
 const connection = new Connection(process.env.SOLANA_RPC!, "confirmed");
@@ -368,7 +371,7 @@ router.get("/token/:mint/history", rl(300), wrap(async (req, res) => {
  * Current price + 7-interval change % + 24h volume.
  */
 router.get("/price/:mint", rl(300), wrap(async (req, res) => {
-  const { mint } = req.params;
+  const mint = req.params.mint as string;
   const f = await redis.hmget(
     `token:${mint}`,
     "priceQuote", "priceUsd", "marketCapUsd",
@@ -376,7 +379,16 @@ router.get("/price/:mint", rl(300), wrap(async (req, res) => {
     "1m", "5m", "15m", "30m", "1h", "4h", "24h",
     "volumeUsd", "volume24hUsd",
   );
-  if (!f[0]) return res.status(404).json({ success: false, error: "Token not found or no price yet" });
+  if (!f[0]) {
+    // Auto-trigger global tracking for unknown tokens — returns 202 while warming up
+    const status = await globalTracker.watchToken(mint);
+    return res.status(202).json({
+      success: true,
+      status: status === "tracking" ? "warming_up" : status,
+      mint,
+      message: "Token tracking initiated. Price data will be available within 5-10 seconds.",
+    });
+  }
   const [pq, pu, mcap, liq, liqUsd, c1m, c5m, c15m, c30m, c1h, c4h, c24h, volAll, vol24h] = f;
 
   res.set("Cache-Control", "public, max-age=5");
@@ -758,5 +770,165 @@ router.get("/stats", rl(300), wrap(async (_req, res) => {
     tokensInRedis: tokenCount,
     uptime:        process.uptime().toFixed(0) + "s",
     timestamp:     new Date().toISOString(),
+  });
+}));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WALLET PNL API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/wallet/:wallet/pnl
+ * Full wallet PnL: summary + all token positions.
+ *
+ * Computes weighted-average cost basis from on-chain trade history.
+ * First request triggers an RPC scan (~3-8s), subsequent requests are cached (2min).
+ *
+ * Response: WalletPnlResponse { wallet, summary, tokens, updatedAt }
+ */
+router.get("/wallet/:wallet/pnl", rl(60), wrap(async (req, res) => {
+  const wallet = req.params.wallet as string;
+
+  try { new PublicKey(wallet); }
+  catch { return res.status(400).json({ success: false, error: "Invalid wallet address" }); }
+
+  try {
+    const result = await computeWalletPnl(wallet);
+    return res.json({ success: true, ...result });
+  } catch (e: any) {
+    console.error(`[PnL] Computation failed for ${wallet.slice(0, 12)}:`, e.message);
+    return res.status(500).json({ success: false, error: "PnL computation failed" });
+  }
+}));
+
+/**
+ * GET /api/wallet/:wallet/pnl/:mint
+ * PnL for a specific token position.
+ *
+ * Returns the per-token PnL object or 404 if no trades found for that mint.
+ */
+router.get("/wallet/:wallet/pnl/:mint", rl(60), wrap(async (req, res) => {
+  const wallet = req.params.wallet as string;
+  const mint   = req.params.mint as string;
+
+  try { new PublicKey(wallet); }
+  catch { return res.status(400).json({ success: false, error: "Invalid wallet address" }); }
+
+  try { new PublicKey(mint); }
+  catch { return res.status(400).json({ success: false, error: "Invalid mint address" }); }
+
+  try {
+    const tokenPnl = await getTokenPnl(wallet, mint);
+    if (!tokenPnl) {
+      return res.status(404).json({ success: false, error: "No trades found for this token" });
+    }
+    return res.json({ success: true, wallet, ...tokenPnl });
+  } catch (e: any) {
+    console.error(`[PnL] Token PnL failed for ${wallet.slice(0, 12)}/${mint.slice(0, 12)}:`, e.message);
+    return res.status(500).json({ success: false, error: "PnL computation failed" });
+  }
+}));
+
+/**
+ * POST /api/price/:mint/watch
+ * Start tracking any token globally. Idempotent — no-op if already tracked.
+ */
+router.post("/price/:mint/watch", rl(60), wrap(async (req, res) => {
+  const mint = req.params.mint as string;
+  if (!mint || mint.length < 32) {
+    return res.status(400).json({ success: false, error: "Invalid mint address" });
+  }
+
+  const status = await globalTracker.watchToken(mint);
+  const since = await redis.hget(`token:${mint}`, "createdAt");
+
+  res.json({
+    success: true,
+    status,
+    mint,
+    since: since ? parseInt(since) : null,
+    watchedCount: globalTracker.watchedCount,
+  });
+}));
+
+/**
+ * DELETE /api/price/:mint/watch
+ * Stop tracking a globally-watched token. Frees Geyser capacity.
+ */
+router.delete("/price/:mint/watch", rl(60), wrap(async (req, res) => {
+  const mint = req.params.mint as string;
+  const removed = await globalTracker.unwatchToken(mint);
+
+  res.json({
+    success: true,
+    removed,
+    mint,
+    watchedCount: globalTracker.watchedCount,
+  });
+}));
+
+/**
+ * GET /api/global/status
+ * Returns the current state of the global tracker.
+ */
+router.get("/global/status", rl(300), wrap(async (_req, res) => {
+  res.json({
+    success: true,
+    watchedCount: globalTracker.watchedCount,
+    maxCapacity: 200,
+    uptime: process.uptime().toFixed(0) + "s",
+  });
+}));
+
+/**
+ * GET /api/price/:address/candlesticks
+ * Returns OHLCV candles matching the Axiom/Moralis API schema.
+ */
+router.get("/price/:address/candlesticks", rl(100), wrap(async (req, res) => {
+  const address = req.params.address as string;
+  const cursor = req.query.cursor as string | undefined;
+  const timeframe = (req.query.timeframe as string) || "1min";
+  const currency = (req.query.currency as string) || "usd";
+  const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 100, 1), 1000);
+  
+  let fromDate = req.query.fromDate as string;
+  let toDate = req.query.toDate as string;
+
+  // Convert to unix seconds
+  let fromSec = 0;
+  let toSec = Math.floor(Date.now() / 1000);
+
+  if (fromDate) {
+    if (/^\d+$/.test(fromDate)) {
+      fromSec = parseInt(fromDate);
+    } else {
+      fromSec = Math.floor(new Date(fromDate).getTime() / 1000);
+    }
+  } else {
+    // Default to 1 day ago if not provided (per schema defaults roughly)
+    fromSec = toSec - 86400;
+  }
+
+  if (toDate) {
+    if (/^\d+$/.test(toDate)) {
+      toSec = parseInt(toDate);
+    } else {
+      toSec = Math.floor(new Date(toDate).getTime() / 1000);
+    }
+  }
+
+  // Ensure tracking is active for this token (no-op if already tracking)
+  globalTracker.watchToken(address).catch(console.error);
+
+  const candles = await getCandlesticks(address, timeframe, fromSec, toSec, currency as "usd" | "native", limit);
+
+  return res.json({
+    cursor: null,
+    page: 1,
+    pairAddress: address, // Or use the actual pool address if we want to fetch it
+    tokenAddress: address,
+    timeframe,
+    currency,
+    result: candles,
   });
 }));

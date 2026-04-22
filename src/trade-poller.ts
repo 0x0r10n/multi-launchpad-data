@@ -149,22 +149,39 @@ function extractSwapFromParsedTx(
 export async function recordGlobalTrades(mint: string, trades: TradeRecord[]) {
   if (trades.length === 0) return;
 
-  const pipe = redis.pipeline();
   const now = Date.now();
 
-  for (const trade of trades) {
-    // Dedup by signature — skip if already recorded
-    const member = `${trade.type}:${trade.solAmount}:${trade.timestamp}`;
-    pipe.zadd(`trades:${mint}`, trade.timestamp, member);
+  // Use individual ZADD NX to detect genuinely new trades before incrementing counters.
+  // This prevents double-counting if the same trades are polled again after a restart.
+  const pipe = redis.pipeline();
+  const members: string[] = [];
 
-    // Update buy/sell/volume counters
-    if (trade.type === "buy") pipe.hincrby(`token:${mint}`, "buys", 1);
-    else                       pipe.hincrby(`token:${mint}`, "sells", 1);
-    pipe.hincrby(`token:${mint}`, "totalTxns", 1);
-    pipe.hincrbyfloat(`token:${mint}`, "volume", trade.solAmount);
+  for (const trade of trades) {
+    const member = `${trade.type}:${trade.solAmount}:${trade.timestamp}`;
+    members.push(member);
+    // NX = only add if member doesn't already exist; returns 1 if added, 0 if exists
+    pipe.zadd(`trades:${mint}`, "NX", trade.timestamp, member);
+  }
+
+  const results = await pipe.exec();
+
+  // Now increment counters only for genuinely new trades
+  const counterPipe = redis.pipeline();
+  let newCount = 0;
+
+  for (let i = 0; i < trades.length; i++) {
+    const wasAdded = results?.[i]?.[1] === 1;
+    if (wasAdded) {
+      newCount++;
+      const trade = trades[i];
+      if (trade.type === "buy") counterPipe.hincrby(`token:${mint}`, "buys", 1);
+      else                       counterPipe.hincrby(`token:${mint}`, "sells", 1);
+      counterPipe.hincrby(`token:${mint}`, "totalTxns", 1);
+      counterPipe.hincrbyfloat(`token:${mint}`, "volume", trade.solAmount);
+    }
   }
 
   // Trim trades older than 24h
-  pipe.zremrangebyscore(`trades:${mint}`, 0, now - 86_400_000);
-  await pipe.exec();
+  counterPipe.zremrangebyscore(`trades:${mint}`, 0, now - 86_400_000);
+  if (newCount > 0) await counterPipe.exec();
 }

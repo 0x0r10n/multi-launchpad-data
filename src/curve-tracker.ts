@@ -39,7 +39,7 @@ async function calcVolume24h(mint: string, cutoff: number): Promise<number> {
 // ── Curve decoding: delegated entirely to the launchpad parser registry ───────
 function decodeCurveAccount(data: Buffer, platform: string, mint?: string): CurveState | null {
   const result = getParser(platform)?.parseCurveData(data) ?? null;
-  if (!result) {
+  if (!result && platform !== "raydium") {
     const hexDump = data.slice(0, Math.min(data.length, 80)).toString("hex");
     const mintTag = mint ? ` mint=${mint.slice(0, 12)}` : "";
     // For Meteora DBC/Bags: also dump bytes 220-260 so reserves at offset 232 are visible

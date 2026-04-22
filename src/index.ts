@@ -8,6 +8,7 @@ import { startPriceTracker, getPriceHistory, recordPrice } from "./price-tracker
 import { queueRiskAnalysis, queueInitialQuickRisk, startHolderSnapshot } from "./risk-analyzer";
 import { buildTokenPayload } from "./payload-builder";
 import { router as apiRouter } from "./routes/api";
+import { globalTracker } from "./global-tracker";
 import Redis from "ioredis";
 import "dotenv/config";
 import cors from "cors";
@@ -23,6 +24,9 @@ const io = new Server(server, { cors: { origin: "*" } });
 const redis = new Redis(process.env.REDIS_URL!);
 const subscriber = new Redis(process.env.REDIS_URL!);
 const yellowstone = new YellowstoneManager();
+
+// Initialize the global tracker so api can dynamically add tokens
+globalTracker.init(yellowstone);
 
 // Pending first-curve resolvers: mint → resolve fn.
 // Registered synchronously on new-launch so Geyser delivery is never missed.
@@ -104,6 +108,14 @@ io.on("connection", (socket) => {
       } else if (room.startsWith("chart:")) {
         const mint = room.slice(6);
         if (mint) {
+          // Auto-watch: if this isn't a known launchpad token, start global tracking
+          const knownPlatform = await redis.hget(`token:${mint}`, "platform");
+          if (!knownPlatform) {
+            globalTracker.watchToken(mint).catch(() => {});
+          } else {
+            globalTracker.touch(mint); // keep alive if already globally tracked
+          }
+
           const history = await getPriceHistory(mint, 500);
           socket.emit("snapshot", {
             type: "snapshot",

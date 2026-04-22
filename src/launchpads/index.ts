@@ -7,6 +7,7 @@ import { MoonParser, MOONSHOT_PROGRAM_ID, MOON_EXCLUDE_WALLETS } from "./moon";
 import { MeteoraParser, BagsParser, METEORA_DBC_PROGRAM_ID }  from "./bags";
 import { LetsBonkParser, LETSBONK_CONFIG_ACCOUNT }            from "./letsbonk";
 import { LaunchLabParser, LAUNCHLAB_PROGRAM_ID }              from "./launchlab";
+import { RaydiumAmmParser, RAYDIUM_AMM_V4_PROGRAM_ID }        from "./raydium";
 
 export type { LaunchpadParser, TokenMetadata, CurveState } from "./types";
 export { PumpParser }                                            from "./pump";
@@ -14,6 +15,7 @@ export { MoonParser, MOONSHOT_PROGRAM_ID, MOON_EXCLUDE_WALLETS } from "./moon";
 export { MeteoraParser, BagsParser, METEORA_DBC_PROGRAM_ID }    from "./bags";
 export { LetsBonkParser, LETSBONK_CONFIG_ACCOUNT }               from "./letsbonk";
 export { LaunchLabParser, LAUNCHLAB_PROGRAM_ID }                 from "./launchlab";
+export { RaydiumAmmParser, RAYDIUM_AMM_V4_PROGRAM_ID }           from "./raydium";
 
 // Parsers used for program-ID-based detection (Pump, Moon, Meteora).
 // LaunchLab and LetsBonk share the same program ID and are handled separately in
@@ -26,6 +28,7 @@ const PARSERS: LaunchpadParser[] = [
   MeteoraParser,   // id="meteora" — label may be overridden to "bags" by caller
   LetsBonkParser,  // programId = config account — included for Yellowstone subscription only
   LaunchLabParser,
+  RaydiumAmmParser,
 ];
 
 // id → parser

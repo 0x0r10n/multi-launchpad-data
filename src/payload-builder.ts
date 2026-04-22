@@ -43,6 +43,7 @@ export async function buildTokenPayload(
     platform === "letsbonk"  ? "https://letsbonk.fun" :
     platform === "launchlab" ? "https://raydium.io/launchlab" :
     platform === "meteora"   ? "https://meteora.ag" :
+    platform === "raydium"   ? "https://raydium.io" :
                                "https://pump.fun";
 
   const payload = {

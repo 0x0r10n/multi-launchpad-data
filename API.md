@@ -1102,3 +1102,168 @@ Now auto-triggers tracking for unknown tokens. Returns 202 while warming up.
 }
 ```
 
+---
+
+## Wallet PnL API
+
+Real-time profit and loss tracking for any Solana wallet. Uses **weighted-average cost basis** computed from on-chain transaction history. **Zero third-party APIs** — all trade data extracted from parsed RPC transactions.
+
+### Architecture
+
+```
+GET /api/wallet/:wallet/pnl
+  │
+  ├─► wallet-scanner.ts
+  │     ├── getSignaturesForAddress (up to 200 txs)
+  │     ├── getParsedTransactions (batch 5 at a time)
+  │     └── extractTradesFromParsedTx:
+  │           - Computes token balance deltas (pre vs post)
+  │           - Computes SOL balance deltas (adjusted for fees)
+  │           - Matches positive token delta + negative SOL delta = buy
+  │           - Matches negative token delta + positive SOL delta = sell
+  │
+  ├─► pnl-engine.ts
+  │     ├── Groups trades by mint, sorted oldest-first
+  │     ├── Weighted average cost basis per token:
+  │     │     buy  → costBasis += priceUsd, holding += tokenAmount
+  │     │     sell → realized += (sellUsd - avgCost × tokensSold)
+  │     ├── Fetches current price from token:{mint} for unrealized PnL
+  │     └── Aggregates into wallet summary
+  │
+  └─► Redis cache (2 min TTL):
+        wallet:pnl:{wallet}          — full WalletPnlResponse
+        wallet:pnl:{wallet}:{mint}   — individual TokenPnl
+        wallet:trades:{wallet}       — raw NormalizedTrade[] array
+```
+
+### Cost Basis Method
+
+**Weighted Average Cost (WAC)**:
+- When you buy tokens, the cost basis is accumulated: `costBasis += buyPriceUsd`
+- The average cost per token = `costBasis / holding`
+- When you sell, realized PnL = `sellPriceUsd - (avgCostPerToken × tokensSold)`
+- Remaining cost basis is reduced proportionally: `costBasis -= avgCostPerToken × tokensSold`
+- Unrealized PnL = `(holding × currentPriceUsd) - costBasis`
+
+### Supported DEX Programs
+
+| Program | Name |
+|---------|------|
+| `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | Raydium AMM V4 |
+| `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump.fun |
+| `MoonCVVNZFSYkqNXP6bxHLPl6A4JInA9ccjfmqr2wnb` | Moon.it |
+| `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` | Meteora DLMM |
+| `dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN` | Meteora DBC |
+| `LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj` | LaunchLab |
+| `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` | Jupiter V6 |
+| `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` | Orca Whirlpool |
+
+### Redis Schema
+
+| Key | Type | TTL | Description |
+|-----|------|-----|-------------|
+| `wallet:pnl:{wallet}` | String (JSON) | 2min | Full WalletPnlResponse |
+| `wallet:pnl:{wallet}:{mint}` | String (JSON) | 2min | Individual TokenPnl |
+| `wallet:trades:{wallet}` | String (JSON) | 2min | Raw NormalizedTrade[] |
+
+### `GET /api/wallet/:wallet/pnl`
+
+Full wallet PnL: summary + all token positions. Rate limit: 60 req/min.
+
+First request triggers an RPC scan (~3-8s). Subsequent requests served from cache (2min TTL).
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "wallet": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "summary": {
+    "realized": 45.23,
+    "unrealized": -12.50,
+    "total": 32.73,
+    "totalInvested": 320.00,
+    "currentValue": 85.50,
+    "tokenCount": 15,
+    "buyTransactions": 42,
+    "sellTransactions": 18,
+    "totalTransactions": 60
+  },
+  "tokens": {
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": {
+      "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      "holding": 1000000,
+      "held": 5000000,
+      "sold": 4000000,
+      "sold_usd": 120.50,
+      "realized": 40.50,
+      "unrealized": -5.20,
+      "total": 35.30,
+      "total_sold": 0.85,
+      "total_invested": 80.00,
+      "average_buy_amount": 0.000016,
+      "current_value": 14.80,
+      "cost_basis": 20.00,
+      "first_buy_time": 1713500000000,
+      "last_buy_time": 1713550000000,
+      "last_sell_time": 1713580000000,
+      "last_trade_time": 1713580000000,
+      "buy_transactions": 3,
+      "sell_transactions": 2,
+      "total_transactions": 5
+    }
+  },
+  "updatedAt": 1713600000000
+}
+```
+
+### `GET /api/wallet/:wallet/pnl/:mint`
+
+PnL for a specific token position. Rate limit: 60 req/min.
+
+Returns the per-token PnL object, or 404 if no trades found.
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "wallet": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  "holding": 1000000,
+  "held": 5000000,
+  "sold": 4000000,
+  "sold_usd": 120.50,
+  "realized": 40.50,
+  "unrealized": -5.20,
+  "total": 35.30,
+  "total_sold": 0.85,
+  "total_invested": 80.00,
+  "average_buy_amount": 0.000016,
+  "current_value": 14.80,
+  "cost_basis": 20.00,
+  "first_buy_time": 1713500000000,
+  "last_buy_time": 1713550000000,
+  "last_sell_time": 1713580000000,
+  "last_trade_time": 1713580000000,
+  "buy_transactions": 3,
+  "sell_transactions": 2,
+  "total_transactions": 5
+}
+```
+
+**Response (404):**
+
+```json
+{ "success": false, "error": "No trades found for this token" }
+```
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| `src/pnl/types.ts` | TypeScript interfaces for TokenPnl, WalletPnlSummary, WalletPnlResponse, NormalizedTrade |
+| `src/pnl/wallet-scanner.ts` | RPC-based wallet transaction scanner. Extracts normalized trades from parsed transactions. |
+| `src/pnl/pnl-engine.ts` | Weighted-average cost basis PnL computation engine with Redis caching. |
+
+

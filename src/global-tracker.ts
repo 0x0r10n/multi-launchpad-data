@@ -174,12 +174,10 @@ class GlobalTracker {
       const poolAccountInfo = await connection.getAccountInfo(new PublicKey(pool.poolAddress));
       if (!poolAccountInfo?.data) return;
 
-      const rpcUrl = process.env.SOLANA_RPC!;
-
-      // Decode pool + fetch vault balances via RPC
+      // Decode pool + fetch vault balances via shared connection
       const decoded = await decodeRaydiumPoolWithVaults(
         Buffer.from(poolAccountInfo.data),
-        rpcUrl,
+        connection,
       );
       if (!decoded) return;
 
@@ -188,9 +186,13 @@ class GlobalTracker {
       const solPriceJson: any = await solPriceRes.json();
       const solPrice = solPriceJson["So11111111111111111111111111111111111111112"]?.usdPrice ?? 140;
 
-      // Get pool info for decimals
+      // Get pool info for decimals — use the correct side based on SOL position
       const poolInfo = parseRaydiumPoolInfo(Buffer.from(poolAccountInfo.data));
-      const tokenDecimals = poolInfo?.coinDecimals ?? 6;
+      const WSOL = "So11111111111111111111111111111111111111112";
+      const isQuoteSol = poolInfo?.quoteMint === WSOL;
+      const tokenDecimals = isQuoteSol
+        ? (poolInfo?.coinDecimals ?? 6)
+        : (poolInfo?.pcDecimals ?? 6);
 
       // Compute price from reserves
       const LAMPORTS_PER_SOL = 1_000_000_000;
@@ -352,7 +354,6 @@ class GlobalTracker {
   private async pollAllWatched() {
     if (this.watched.size === 0) return;
 
-    const rpcUrl = process.env.SOLANA_RPC!;
     const entries = [...this.watched.values()];
 
     // Get SOL price once per poll cycle
@@ -367,23 +368,27 @@ class GlobalTracker {
     const BATCH_SIZE = 20;
     for (let i = 0; i < entries.length; i += BATCH_SIZE) {
       const batch = entries.slice(i, i + BATCH_SIZE);
-      await Promise.allSettled(batch.map(entry => this.pollSingleToken(entry, solPrice, rpcUrl)));
+      await Promise.allSettled(batch.map(entry => this.pollSingleToken(entry, solPrice)));
     }
   }
 
-  private async pollSingleToken(entry: WatchEntry, solPrice: number, rpcUrl: string) {
+  private async pollSingleToken(entry: WatchEntry, solPrice: number) {
     try {
       const poolAccountInfo = await connection.getAccountInfo(new PublicKey(entry.pool.poolAddress));
       if (!poolAccountInfo?.data) return;
 
       const decoded = await decodeRaydiumPoolWithVaults(
         Buffer.from(poolAccountInfo.data),
-        rpcUrl,
+        connection,
       );
       if (!decoded) return;
 
       const poolInfo = parseRaydiumPoolInfo(Buffer.from(poolAccountInfo.data));
-      const tokenDecimals = poolInfo?.coinDecimals ?? 6;
+      const WSOL = "So11111111111111111111111111111111111111112";
+      const isQuoteSol = poolInfo?.quoteMint === WSOL;
+      const tokenDecimals = isQuoteSol
+        ? (poolInfo?.coinDecimals ?? 6)
+        : (poolInfo?.pcDecimals ?? 6);
 
       const LAMPORTS_PER_SOL = 1_000_000_000;
       const virtualSolN   = Number(decoded.virtualSolReserves);
