@@ -1145,6 +1145,28 @@ GET /api/wallet/:wallet/pnl
 - Remaining cost basis is reduced proportionally: `costBasis -= avgCostPerToken × tokensSold`
 - Unrealized PnL = `(holding × currentPriceUsd) - costBasis`
 
+### Trade Purity Filtering (6 Layers)
+
+Only genuine DEX swaps feed into cost basis and PnL. The scanner applies 6 layers of filtering to separate real trades from noise:
+
+| Layer | Check | What it blocks |
+|-------|-------|---------------|
+| **1. DEX program gate** | At least one `SWAP_PROGRAMS` key in tx accounts | Pure transfers, SPL mints, system program txs |
+| **2. Signer check** | Wallet must be fee payer or confirmed signer | Txs where wallet is just a recipient (airdrops) |
+| **3. SOL threshold** | Net SOL movement must exceed 0.001 SOL | Dust attacks, fee-only txs, zero-cost airdrops |
+| **4. Direction coherence** | SOL and token deltas must be in opposite directions (buy = SOL out + tokens in, sell = SOL in + tokens out) | Transfers where tokens move without correlated SOL movement |
+| **5. Token threshold** | Token delta must be ≥ 1 raw unit | Sub-dust MEV artifacts, account creation residue |
+| **6. Multi-mint disambiguation** | For Jupiter-style multi-hop routes, only the terminal swap (largest token delta) is recorded | Intermediary routing tokens (USDC, SOL wrappers) |
+
+**What this means in practice:**
+- ✅ Pump.fun buy → counted as trade
+- ✅ Raydium sell → counted as trade
+- ✅ Jupiter SOL→BONK → counted as one BONK buy (intermediary USDC hop filtered)
+- ✗ Random airdrop of 1M tokens → filtered (no SOL movement)
+- ✗ Someone sends you tokens → filtered (no DEX program involved)
+- ✗ MEV bot sandwich inflow → filtered (SOL delta doesn't match direction)
+- ✗ Dust attack (0.00001 SOL worth of tokens) → filtered (below SOL threshold)
+
 ### Supported DEX Programs
 
 | Program | Name |
